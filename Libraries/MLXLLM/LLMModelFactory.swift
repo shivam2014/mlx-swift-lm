@@ -554,17 +554,43 @@ public final class LLMModelFactory: ModelFactory {
         // Strip VLM-style prefixes (e.g., "language_model.") from per-layer quantization keys.
         // VLM configs like Gemma 4 store keys as "language_model.model.layers.0.mlp.gate_proj"
         // but after sanitize, the model paths are "model.layers.0.mlp.gate_proj".
+        // Keep BOTH stripped and unstripped versions: some models (e.g. Qwen35MoEModel)
+        // retain "language_model." in their module hierarchy and look up paths with it.
         var plq = baseConfig.perLayerQuantization
         if var perLayer = plq {
-            var stripped = [String: BaseConfiguration.QuantizationOption]()
+            var merged = perLayer.perLayerQuantization
             for (key, value) in perLayer.perLayerQuantization {
+                // Keep both stripped and unstripped so models that retain
+                // "language_model." in their module hierarchy (e.g. Qwen35MoEModel)
+                // can look up paths with or without the prefix.
                 let strippedKey = key
                     .replacingOccurrences(of: "language_model.", with: "")
-                stripped[strippedKey] = value
+                if strippedKey != key {
+                    merged[strippedKey] = value
+                }
+
+                // Add fused gate_up_proj entries derived from gate_proj.
+                // Qwen35MoEModel.sanitize() concatenates gate_proj + up_proj →
+                // gate_up_proj, but the per-tensor quantization map only has the
+                // split keys. The lookup for the fused key would fall back to the
+                // default bits, causing a shape mismatch.
+                for fusedSuffix in ["gate_proj", "up_proj"] {
+                    if key.hasSuffix(".\(fusedSuffix)") {
+                        let fusedKey = key.dropLast(fusedSuffix.count) + "gate_up_proj"
+                        if merged[String(fusedKey)] == nil {
+                            merged[String(fusedKey)] = value
+                        }
+                        let strippedFused = String(fusedKey)
+                            .replacingOccurrences(of: "language_model.", with: "")
+                        if merged[strippedFused] == nil {
+                            merged[strippedFused] = value
+                        }
+                    }
+                }
             }
             plq = BaseConfiguration.PerLayerQuantization(
                 quantization: perLayer.quantization,
-                perLayerQuantization: stripped
+                perLayerQuantization: merged
             )
         }
 
