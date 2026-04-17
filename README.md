@@ -1,153 +1,157 @@
-# MLX Swift LM
+# mlx-swift-lm (fork)
 
-MLX Swift LM is a Swift package to build tools and applications with large
-language models (LLMs) and vision language models (VLMs) in [MLX Swift](https://github.com/ml-explore/mlx-swift).
+**Fork of:** https://github.com/ekryski/mlx-swift-lm  
+**Your fork:** https://github.com/shivam2014/mlx-swift-lm  
+**Branch:** `ek/tom-eric-moe-tuning`  
+**Purpose:** Production-ready MLX inference server with custom fixes and experimental features for Qwen3.6 and beyond.
 
-Some key features include:
+## Why this fork exists
 
-- Integration with the Hugging Face Hub to easily use thousands of LLMs with a single command.
-- Low-rank (LoRA) and full model fine-tuning with support for quantized models.
-- Many model architectures for both LLMs and VLMs.
+Upstream `ekryski/mlx-swift-lm` is an excellent Swift-based LLM server with Metal acceleration, but certain models require adjustments:
 
-For some example applications and tools that use MLX Swift LM check out
-the [MLX Swift Examples](https://github.com/ml-explore/mlx-swift-examples).
+- **Qwen3.6 Config-I models**: Per-tensor quantization lookup was broken → LM head shape mismatches. Fixed in `4537a49`.
+- **Thinking mode (Qwen3)**: Passing `enable_thinking: true` alongside `TAG_think` in chat template causes HTTP 400. Fixed in `a439af0` with proper detection.
+- **KV cache control**: Added `--kv` flag to select compression schemes (e.g., `turbo4v2`). Fixed in `fde5fd4`.
 
-# Using MLX Swift LM
+This fork stabilizes Qwen3.6-35B-A3B Config-I and provides a clean base for further R&D (speculative prefill, cross-family token importance, etc.).
 
-The MLXLLM, MLXVLM, MLXLMCommon, and MLXEmbedders libraries are available
-as Swift Packages.
+## Getting Started
 
-Add the following dependency to your Package.swift:
+### Prerequisites
 
-```swift
-.package(url: "https://github.com/ml-explore/mlx-swift-lm/", branch: "main"),
-```
+- macOS 15+ (Apple Silicon)
+- Xcode command line tools: `xcode-select --install`
+- Swift 6.3+
+- 64GB RAM (for 35B models with context)
+- Git
 
-or use the latest release:
-
-```swift
-.package(url: "https://github.com/ml-explore/mlx-swift-lm/", .upToNextMinor(from: "2.29.1")),
-```
-
-Then add one or more libraries to the target as a dependency:
-
-```swift
-.target(
-    name: "YourTargetName",
-    dependencies: [
-        .product(name: "MLXLLM", package: "mlx-swift-lm")
-    ]),
-```
-
-Alternatively, add `https://github.com/ml-explore/mlx-swift-lm/` to the
-`Project Dependencies` and set the `Dependency Rule` to `Branch` and `main` in
-Xcode.
-
-# Quick Start
-
-See also [MLXLMCommon](Libraries/MLXLMCommon). You can get started with a wide
-variety of open weights LLMs and VLMs using this simplified API:
-
-```swift
-let model = try await loadModel(id: "mlx-community/Qwen3-4B-4bit")
-let session = ChatSession(model)
-print(try await session.respond(to: "What are two things to see in San Francisco?"))
-print(try await session.respond(to: "How about a great place to eat?"))
-```
-
-Or use the underlying API to control every aspect of the evaluation.
-
-# Why `make` instead of `swift build`
-
-Swift Package Manager (SPM) does not handle several parts of the build pipeline:
-
-- **Metal shaders** -- SPM cannot compile `.metal` files. The MLX Metal kernels must be compiled separately into `mlx.metallib` and copied into the test bundle.
-- **Native C++ dylibs** -- The prefill bridge (`libprefill_bridge_v2.dylib`) is built via `clang++` and must be placed in the build output and test bundle manually.
-- **Submodule staleness** -- When you modify C/C++ files deep in git submodules (`mlx-swift` -> `mlx` -> `mlx-c`), SPM’s build cache may not detect the change. It tracks content signatures keyed by the dependency’s git revision, so edits within a submodule can go stale.
-- **Test bundle regeneration** -- `swift build --build-tests` can regenerate the `.xctest` bundle, wiping previously-copied Metal shaders and dylibs.
-
-The project [Makefile](Makefile) wraps SPM and fills these gaps using file-timestamp dependency tracking. It only rebuilds what actually changed:
-
-| What changed | What rebuilds | What stays cached |
-|---|---|---|
-| A `.metal` or kernel `.h` file | Metal shaders only | SPM targets, bridge dylib |
-| A `.cpp`/`.c`/`.h` in `mlx` or `mlx-c` | SPM’s Cmlx target only | Swift targets, Metal, bridge |
-| Swift sources | SPM incremental rebuild | Metal, bridge |
-| `prefill_bridge_v2.cpp` | Bridge dylib only | SPM, Metal |
-| Nothing | Artifact copy only (~instant) | Everything |
-
-After every build, artifacts (metallib, dylibs) are copied to the release directory and test bundle automatically.
-
-You do not need to use `make` directly for typical workflows -- `setup-dev.sh` and `benchmark.sh` both call it internally. For manual builds or targeted rebuilds, see `make help`.
-
-# Testing
-
-Tests require Metal and must be run via Xcode’s build system so that the MLX
-Metal shaders (`default.metallib`) are built and available. Running `swift test`
-will fail with “Failed to load the default metallib” because SwiftPM does not
-build Metal shaders.
-
-In Xcode: open the package and run tests (Ctrl-U), or from the command line:
+### 1. Clone Your Fork
 
 ```bash
-xcodebuild test -scheme mlx-swift-lm-Package -destination ‘platform=macOS’
+git clone https://github.com/shivam2014/mlx-swift-lm.git
+cd mlx-swift-lm
+git checkout ek/tom-eric-moe-tuning
 ```
 
-# Benchmarking
-
-Inference benchmarks measure prefill throughput, token generation speed, TTFT, **perplexity**, and GPU memory across models, quantization levels, and KV cache configurations. Benchmarks run in **release mode** and write markdown reports to `benchmarks/`.
-
-See [`benchmarks/README.md`](benchmarks/README.md) for the complete CLI reference, methodology details, and environment variable API.
-
-## Setup
-
-Run once after cloning (or after fetching new `mlx-swift` changes):
+### 2. Build MLXServer
 
 ```bash
-./scripts/setup-dev.sh
+./update_mlxserver_fork.sh
 ```
 
-This resolves Swift packages, compiles Metal shaders, builds the prefill bridge dylib, does an initial release build, and copies all artifacts into the test bundle. After setup, all benchmark commands work immediately.
+This script:
+- Switches to `ek/tom-eric-moe-tuning` branch
+- Pulls latest from **your fork** (`fork` remote)
+- Resolves Swift packages
+- Compiles Metal shaders (`make metal`)
+- Builds `MLXServer` binary in `.build/release/`
 
-## Basic Benchmark
+Optional: `./update_mlxserver_fork.sh --fresh` to wipe and rebuild.
 
-Benchmark any registered model family or HuggingFace repo directly:
+### 3. Prepare Model
+
+Download an MLX-format model. Two options:
+
+#### Option A: Qwen3.6-35B-A3B Config-I (this fork's test model)
+
+35B parameter Mixture-of-Experts (MoE) model with mixed per-tensor quantization.
+
+- HuggingFace: https://huggingface.co/thetom-ai/Qwen3.6-35B-A3B-ConfigI-MLX
+- Download with `huggingface-cli`:
 
 ```bash
-# Known model family (downloads automatically on first run)
-./scripts/benchmark.sh --model qwen35-0.8b --context 128
-
-# Any HuggingFace model by repo ID
-./scripts/benchmark.sh --model mlx-community/Qwen3-4B-4bit --context 128
-
-# With perplexity tracking
-./scripts/benchmark.sh --model mlx-community/Qwen3-4B-4bit --context 128 --ppl
+# New Hugging Face CLI (hf). Install: brew install hf
+hf download thetom-ai/Qwen3.6-35B-A3B-ConfigI-MLX --local-dir ~/.cache/huggingface/hub/thetom-ai/Qwen3.6-35B-A3B-ConfigI-MLX
 ```
 
-Results are saved as markdown tables in `benchmarks/<model-family>/`.
+#### Option B: Qwen3.5-0.8B (lightweight test)
 
-## Manual Builds
+For quick checks and speculative prefill draft:
 
-For targeted rebuilds when working on specific parts of the stack:
+- https://huggingface.co/mlx-community/Qwen3.5-0.8B-MLX-4bit-fp16
+
+### 4. Launch Server
 
 ```bash
-make                # Full incremental build (only rebuilds what changed)
-make metal          # Recompile Metal shaders only
-make bridge         # Recompile prefill bridge dylib only
-make spm            # Swift build only (with Cmlx cache invalidation)
-make status         # Show what’s built and what’s stale
-make clean-cmlx     # Force SPM to recompile C/C++ on next build
-make help           # Full reference
+# Set model path if not using default
+export FORK_MODEL_PATH="$HOME/.cache/huggingface/hub/thetom-ai/Qwen3.6-35B-A3B-ConfigI-MLX"
+
+# Start server
+python3 scripts/serve_fork.py
 ```
 
-For more advanced benchmark combinations and options see [`benchmarks/README.md`](benchmarks/README.md).
+This launches MLXServer on `http://127.0.0.1:8000/v1` with flags:
+```
+--slots 4
+--kv turbo4v2
+```
 
-# Documentation
+Select framework 6 from upstream menu? No — this wrapper directly calls MLXServer binary.
 
-Developers can use these examples in their own programs -- just import the swift package!
+### 5. Test
 
-- [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
-- [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon) -- common API for LLM and VLM
-- [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm) -- large language model example implementations
-- [MLXVLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxvlm) -- vision language model example implementations
-- [MLXEmbedders](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxembedders) -- popular Encoders / Embedding models example implementations
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-model",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 10
+  }'
+```
+
+## What's Different from Upstream
+
+| Feature | Upstream | This fork |
+|---------|----------|-----------|
+| Qwen3.6 Config-I support | ❌ Broken LM head loading | ✅ Fixed per-tensor lookup for MoE models |
+| Thinking mode | ❌ Double-enable → 400 error | ✅ Detects prefilled `<think>` |
+| KV cache scheme selection | ❌ Hardcoded | ✅ `--kv <scheme>` (e.g. `turbo4v2`) |
+| Speculative prefill (experimental) | ❌ | ✅ Module present, integration pending |
+
+## Branches
+
+- `ek/tom-eric-moe-tuning` — our working branch (based on upstream's `ek/tom-eric-moe-tuning`)
+- `main` — mirrors upstream main (do not commit here)
+
+## Key Commits
+
+- `4537a49` — Fix per-tensor quantization for Qwen3.6 Config-I MoE models
+- `fde5fd4` — Add `--kv` CLI flag; bump swift-transformers
+- `a439af0` — Resolve thinking mode double-enable conflict
+- `0aee329` — Add Q-capture hook for speculative prefill (in progress)
+
+## Updating Your Fork
+
+```bash
+# Pull latest from your fork (shivam2014/mlx-swift-lm)
+./update_mlxserver_fork.sh
+```
+# If you want to sync with upstream ekryski changes:
+git fetch origin
+git rebase origin/ek/tom-eric-moe-tuning
+# Resolve conflicts, then push to your fork:
+git push fork ek/tom-eric-moe-tuning
+```
+
+## Experimental: Speculative Prefill
+
+Paper: arXiv:2603.02631 — Cross-Family Speculative Prefill
+
+Status: Engine implemented in `Sources/SpeculativePrefill/` (not yet integrated). See that module's README for details.
+
+## Troubleshooting
+
+**Server crashes with "Failed to load the default metallib"**  
+Run `make metal` manually or ensure `./update_mlxserver_fork.sh` completed the metallib step.
+
+**Out of memory**  
+- Ensure KV scheme is `turbo4v2` or smaller
+- Reduce context length
+- Use a smaller model (e.g., Qwen3.5-27B instead of 35B)
+
+**Thinking mode not working**  
+Check server logs: it should detect `<think>` in the last 8 tokens of the prompt. If missing, ensure your chat template includes it.
+
+**Model fails to load with shape mismatch**  
+This fork fixes Qwen3.6 Config-I; ensure you're using the patched branch and rebuilt the server.
