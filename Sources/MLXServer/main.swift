@@ -798,8 +798,7 @@ final class SimpleHTTPServer {
                 }
                 // Try with tools first; fall back to without if template doesn't support them
                 do {
-                    let thinkCtx: [String: any Sendable] = ["enable_thinking": true]
-                    tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs, additionalContext: thinkCtx)
+                    tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
                 } catch {
                     log("Chat template with tools failed (\(error)), retrying without tools")
                     // Inject tool descriptions into system prompt instead
@@ -823,10 +822,16 @@ final class SimpleHTTPServer {
                     }
                 }
             } else {
-                // Pass enable_thinking for models that support it (Qwen3, etc.)
-                let thinkingContext: [String: any Sendable] = ["enable_thinking": true]
-                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: nil, additionalContext: thinkingContext)
+                // Qwen 3.6: let the chat template's TAG_think prompt handle thinking mode.
+                // Passing enable_thinking=true causes double-enable conflict → HTTP 400.
+                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: nil)
             }
+            // If chat template injected <think> as assistant prefix, model outputs thinking
+            // content directly (no opening <think> tag in response, only closing </think>).
+            // Decode last 8 tokens to text — reliable regardless of tokenizer vocab layout.
+            let lastTokensText = ctx.tokenizer.decode(tokens: Array(tokens.suffix(8)))
+            let promptPrefillsThink = lastTokensText.contains("<think>")
+            log("  think detection: lastTokensText=\(lastTokensText.debugDescription) prefillsThink=\(promptPrefillsThink)")
             // Prompt caching: reuse KV state from previous requests
             let prefillStart = CFAbsoluteTimeGetCurrent()
             let (reusedCache, newTokens, cacheStatus, sessionId) = await promptCache.fetch(tokens: tokens, model: ctx.model)
@@ -845,7 +850,7 @@ final class SimpleHTTPServer {
 
             slot.promptTokenCount = tokens.count
             slot.state = .generating
-            log("slot[\(slot.id)] \(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0)")
+            log("slot[\(slot.id)] \(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0) think_prefilled=\(promptPrefillsThink)")
 
             // Always send keepalives for streaming to prevent client ReadTimeout
             // during prefill (bridge init + forward pass can take 10-100s for MoE models)
@@ -886,7 +891,7 @@ final class SimpleHTTPServer {
                     var fullText = ""
                     var thinkText = ""  // accumulated think block content
                     var emittedUpTo = 0  // index in fullText that we've already sent
-                    var inThinkBlock = false
+                    var inThinkBlock = promptPrefillsThink
 
                     var tokenCount = 0
                     for try await generation in try generate(
