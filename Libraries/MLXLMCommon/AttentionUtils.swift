@@ -33,6 +33,8 @@ import MLX
 ///   - cache: Cache instance (any type)
 ///   - scale: Attention scale factor
 ///   - mask: Attention mask
+///   - layerIndex: Optional layer index for Q capture (used by SpeculativePrefill)
+///   - captureQ: Optional closure to receive Q vector copy
 /// - Returns: Attention output [B, nHeads, L, D]
 public func attentionWithCacheUpdate(
     queries: MLXArray,
@@ -40,8 +42,16 @@ public func attentionWithCacheUpdate(
     values: MLXArray,
     cache: KVCache?,
     scale: Float,
-    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+    layerIndex: Int? = nil,
+    captureQ: ((MLXArray) -> Void)? = nil
 ) -> MLXArray {
+    
+    // Q capture hook for speculative prefill importance
+    if layerIndex != nil {
+        // Capture happens before cache update (Q is original queries)
+        captureQ?(queries)
+    }
     guard let cache else {
         return MLXFast.scaledDotProductAttention(
             queries: queries,
