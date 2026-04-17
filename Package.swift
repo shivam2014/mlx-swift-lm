@@ -92,7 +92,7 @@ let package = Package(
         mlxSwiftDependency,
         .package(
             url: "https://github.com/huggingface/swift-transformers",
-            .upToNextMinor(from: "1.2.0")
+            from: "1.3.0"
         ),
     ],
     targets: [

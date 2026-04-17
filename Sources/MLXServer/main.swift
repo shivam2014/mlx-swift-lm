@@ -194,9 +194,11 @@ actor ServerPromptCache {
     var sessions: [CachedSession] = []
     let maxSessions: Int
     var metrics = CacheMetrics()
+    let kvScheme: String?
 
-    init(maxSessions: Int = 3) {
+    init(maxSessions: Int = 3, kvScheme: String? = nil) {
         self.maxSessions = maxSessions
+        self.kvScheme = kvScheme
     }
 
     func recordRequest(hit: Bool, prefillTokens: Int, reusedTokens: Int) {
@@ -289,7 +291,8 @@ actor ServerPromptCache {
 
     private func freshCache(tokens: [Int], model: any LanguageModel) -> ([KVCache], [Int], CacheStatus, UUID) {
         evictIfNeeded()
-        let cache = model.newCache(parameters: nil)
+        let kvParams = kvScheme.map { GenerateParameters(kvScheme: $0) }
+        let cache = model.newCache(parameters: kvParams)
         let session = CachedSession(tokenIds: [], kvCache: cache, lastUsed: Date())
         sessions.append(session)
         let status = CacheStatus.miss(totalTokens: tokens.count, sessionsCount: sessions.count)
@@ -511,16 +514,17 @@ final class SimpleHTTPServer {
         return max(2, min(sessions, 10))  // clamp 2-10
     }
 
-    init(port: UInt16, container: ModelContainer, modelId: String, slotCount: Int = 4) {
+    init(port: UInt16, container: ModelContainer, modelId: String, slotCount: Int = 4, kvScheme: String? = nil) {
         self.port = port
         self.container = container
         self.modelId = modelId
         self.slotCount = slotCount
         let maxSess = SimpleHTTPServer.autoMaxSessions()
-        self.promptCache = ServerPromptCache(maxSessions: maxSess)
+        self.promptCache = ServerPromptCache(maxSessions: maxSess, kvScheme: kvScheme)
         self.slotManager = SlotManager(slotCount: slotCount)
         log("Auto-configured: \(maxSess) max cached sessions (\(ProcessInfo.processInfo.physicalMemory / (1024*1024*1024))GB RAM)")
         log("Parallel inference slots: \(slotCount)")
+        if let kv = kvScheme { log("KV cache scheme: \(kv)") }
     }
 
     func start() throws {
@@ -1462,6 +1466,10 @@ struct MLXServerApp {
             i + 1 < args.count ? Int(args[i + 1]) : nil
         } ?? 4  // Default to 4 parallel slots (like llama-server)
 
+        let kvScheme = args.firstIndex(of: "--kv").flatMap { i in
+            i + 1 < args.count ? args[i + 1] : nil
+        }  // e.g. "turbo4v2", "turbo4", "affine4" — nil = FP16 default
+
         log("Loading model: \(model)")
         let config: ModelConfiguration
         if model.hasPrefix("/") || model.hasPrefix("~") || model.hasPrefix(".") {
@@ -1487,7 +1495,7 @@ struct MLXServerApp {
             }
         }
 
-        let server = SimpleHTTPServer(port: port, container: container, modelId: model, slotCount: slots)
+        let server = SimpleHTTPServer(port: port, container: container, modelId: model, slotCount: slots, kvScheme: kvScheme)
         try server.start()
     }
 }
