@@ -1088,6 +1088,7 @@ final class SimpleHTTPServer {
                 var thinkEmitIdx = fullText.startIndex   // how far we've emitted reasoning
                 var inThinkBlock = promptPrefillsThink
                 var thinkBlockResolved = false  // true once we've seen </think> and switched to content
+                var contentStarted = false  // true once first non-whitespace content has been emitted
 
                 // Tag prefixes that require holdback while the rest of the tag arrives.
                 let tagPrefixes = ["<tool_call", "<function=", "<minimax:", "<invoke", "</think", "<think", "<parameter"]
@@ -1160,16 +1161,21 @@ final class SimpleHTTPServer {
                                 }
                             }
 
-                            // Skip leading whitespace once content begins, to avoid
-                            // a lone "\n" from the template bleeding into output.
-                            if unemittedIdx < fullText.endIndex {
+                            // Once only: skip leading whitespace before any real
+                            // content begins. A lone "\n" from the template closing
+                            // the think block shouldn't bleed into output. Once real
+                            // content has started, whitespace between tokens is
+                            // preserved (critical — "Hey! How can I help" would
+                            // otherwise become "Hey!HowcanIhelp").
+                            if !contentStarted && unemittedIdx < fullText.endIndex {
                                 let u = unemitted()
                                 if let firstNonWS = u.firstIndex(where: { !$0.isWhitespace }) {
                                     if firstNonWS != u.startIndex {
                                         unemittedIdx = firstNonWS
                                     }
+                                    contentStarted = true
                                 } else {
-                                    // All whitespace so far — wait for more
+                                    // All whitespace so far — wait for real content.
                                     continue
                                 }
                             }
