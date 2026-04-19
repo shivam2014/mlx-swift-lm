@@ -362,12 +362,34 @@ actor ServerPromptCache {
                 recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
                 return (session.kvCache, remaining, status, session.id)
             } else {
-                // Divergent tail: DO NOT reuse. Observed leak with TurboQuantKVCache
-                // where trim-in-place leaves compressed K/V state that the attention
-                // path reads despite offset having moved down — content from the
-                // prior conversation's post-prefix tokens bled into responses to
-                // unrelated system prompts. The shared-prefix optimization for
-                // divergent conversations isn't worth correctness risk. Start fresh.
+                // Partial match: the new request shares some prefix but diverges
+                // within the stored session. Two sub-cases:
+                //   (a) Near-full match (legit continuation with tiny template tail
+                //       difference): trim the stored session's tail down to the
+                //       shared prefix and reuse. Re-prefill the divergent remainder.
+                //   (b) Small match (truly different conversation, e.g. different
+                //       system prompt): fall through to freshCache — trimming deep
+                //       into a compressed session and layering new content on top
+                //       has shown KV-leak artifacts under TurboQuant.
+                // The threshold is a ratio because absolute drift depends on
+                // conversation size (short template delta vs massive session fork).
+                let matchRatio = Double(bestPrefix) / Double(max(session.tokenIds.count, 1))
+                if matchRatio >= 0.75 {
+                    if trimAmount > 0 {
+                        for c in session.kvCache {
+                            if c.trim(trimAmount) == 0 {
+                                metrics.trimFailures += 1
+                                return freshCache(tokens: newTokens, model: model)
+                            }
+                        }
+                    }
+                    sessions[bestIdx].lastUsed = Date()
+                    sessions[bestIdx].tokenIds = Array(newTokens[0..<bestPrefix])
+                    let remaining = Array(newTokens[bestPrefix...])
+                    let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
+                    recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
+                    return (session.kvCache, remaining, status, session.id)
+                }
                 return freshCache(tokens: newTokens, model: model)
             }
         }
