@@ -335,27 +335,50 @@ actor ServerPromptCache {
 
         if bestIdx >= 0 && bestPrefix > 0 {
             let session = sessions[bestIdx]
-            // Trim based on actual KV cache size, not tokenIds.count.
-            // The cache may have extra decode tokens from interrupted generation.
-            let actualCacheSize = session.kvCache.first?.offset ?? session.tokenIds.count
+            // Use a KVCache-typed attention layer for the offset — MambaCache
+            // (hybrid Qwen3.6) doesn't track position as `offset` and returns
+            // 0, which would make trimAmount nonsense. Find the first entry
+            // with a real offset; fall back to tokenIds.count.
+            let attentionCache = session.kvCache.first(where: { c in
+                c is KVCacheSimple || c is TurboQuantKVCache || c is QuantizedKVCache || c is RotatingKVCache
+            })
+            let actualCacheSize = attentionCache?.offset ?? session.tokenIds.count
             let trimAmount = actualCacheSize - bestPrefix
 
-            // Python mlx-lm gate: `can_trim_prompt_cache` returns False for
-            // quantized / compressed caches. Trimming them in-place leaves
-            // compressed K/V state past the new offset that the attention
-            // kernel still reads from via slice views, leaking the prior
-            // conversation's content into the new request. We've reproduced
-            // this with TurboQuantKVCache (both offline and from a real
-            // opencode session). Mirror the Python gate: only trim if nothing
-            // is quantized, OR the trim is zero-cost (pure extension).
             let hasQuantized = session.kvCache.contains { c in
                 c is TurboQuantKVCache || c is QuantizedKVCache
             }
-            let pureExtension = (bestPrefix == session.tokenIds.count) && (trimAmount == 0)
+            let hasMamba = session.kvCache.contains { c in
+                // MambaCache isn't trimmable by a token count — its state is a
+                // running recurrence, not a KV window. Any trim on a hybrid
+                // session desynchronises Mamba layers from attention layers.
+                String(describing: type(of: c)).contains("MambaCache")
+            }
+            // Template drift: chat template re-renders the historical assistant
+            // turn on subsequent requests, producing a 1-5 token tail difference
+            // from what we stored. Absolute tolerance distinguishes this from
+            // truly-divergent conversation forks (hundreds+ tokens of drift).
+            let unmatchedTail = session.tokenIds.count - bestPrefix
+            let pureExtension = (unmatchedTail == 0) && (trimAmount <= 0)
+
+            // Full cache-layer inventory: which types, offsets, trimmability.
+            // Diagnosing prefix-reuse needs all of this at once.
+            var cacheInventory: [String] = []
+            var typeCounts: [String: Int] = [:]
+            for (i, c) in session.kvCache.enumerated() {
+                let t = String(describing: type(of: c))
+                typeCounts[t, default: 0] += 1
+                if i < 3 {
+                    cacheInventory.append("L\(i)=\(t)[off=\(c.offset) trimmable=\(c.isTrimmable)]")
+                }
+            }
+            let counts = typeCounts.map { "\($0.key)×\($0.value)" }.sorted().joined(separator: " ")
+            let canTrim = canTrimPromptCache(session.kvCache)
+            log("  fetch: bestPrefix=\(bestPrefix) tokenIds=\(session.tokenIds.count) actualCacheSize=\(actualCacheSize) trimAmount=\(trimAmount) unmatchedTail=\(unmatchedTail) pureExt=\(pureExtension) hasQuantized=\(hasQuantized) hasMamba=\(hasMamba) canTrim=\(canTrim)")
+            log("  fetch: cacheLayers={\(counts)} sample=[\(cacheInventory.joined(separator: " "))]")
 
             if pureExtension {
-                // Safe for any cache type: no data gets discarded, we just
-                // extend the cache with the new tail tokens.
+                // Safe for any cache type: no data discarded, just extend.
                 sessions[bestIdx].lastUsed = Date()
                 sessions[bestIdx].tokenIds = Array(newTokens[0..<bestPrefix])
                 let remaining = Array(newTokens[bestPrefix...])
@@ -364,20 +387,39 @@ actor ServerPromptCache {
                 return (session.kvCache, remaining, status, session.id)
             }
 
+            // Quantized/compressed caches: trim leaves compressed K/V past the
+            // new offset that attention still reads via slice views, leaking
+            // content. Force fresh on any trim — reproduced as a real leak.
             if hasQuantized {
-                // Would need to trim a quantized cache — unsafe (leaks via
-                // persisted compressed K/V past the new offset). Force fresh.
                 return freshCache(tokens: newTokens, model: model)
             }
 
-            // Non-quantized caches: trimming is safe because attention reads
-            // only [..<offset] directly from the underlying tensor, and the
-            // prefill overwrites the positions we care about.
-            if bestPrefix == session.tokenIds.count {
-                // Extension with a stale generated tail — trim the tail, extend.
+            // Small tail drift only. Template re-renders the historical
+            // assistant turn in 1-5 extra tokens on follow-up requests, while a
+            // truly-divergent conversation fork differs by hundreds-to-thousands
+            // of tokens. The observed leak case had unmatchedTail=2660, so the
+            // 20-token cap cleanly separates legit drift from divergence.
+            //
+            // For Mamba-hybrid models: MambaCache.trim() returns 0 (not
+            // trimmable), so the trim loop below will catch it and fall back
+            // to freshCache automatically — no separate gate needed. That costs
+            // us cache reuse on drifted follow-ups, but prevents Mamba state
+            // desync from corrupting output.
+            _ = hasMamba  // currently unused; retained in the log line for diagnostics
+            if unmatchedTail <= 20 && trimAmount >= 0 {
                 if trimAmount > 0 {
-                    for c in session.kvCache {
-                        if c.trim(trimAmount) == 0 {
+                    // Use the model's own canTrimPromptCache gate. Returns false
+                    // for any layer that isn't trimmable (e.g. MambaCache —
+                    // stateful recurrence, no token-wise rewind).
+                    if !canTrimPromptCache(session.kvCache) {
+                        log("  fetch: cannot trim — some layer not trimmable (hybrid Mamba?)")
+                        metrics.trimFailures += 1
+                        return freshCache(tokens: newTokens, model: model)
+                    }
+                    for (i, c) in session.kvCache.enumerated() {
+                        let t = c.trim(trimAmount)
+                        if t == 0 && c.isTrimmable {
+                            log("  fetch: trim failed on layer[\(i)] type=\(type(of: c)) isTrimmable=true but returned 0")
                             metrics.trimFailures += 1
                             return freshCache(tokens: newTokens, model: model)
                         }
@@ -391,26 +433,6 @@ actor ServerPromptCache {
                 return (session.kvCache, remaining, status, session.id)
             }
 
-            // Divergent with a non-quantized cache: still safe to trim, but
-            // only worth the effort when the match is substantial (template
-            // drift case). Below threshold, skip to fresh.
-            let matchRatio = Double(bestPrefix) / Double(max(session.tokenIds.count, 1))
-            if matchRatio >= 0.75 {
-                if trimAmount > 0 {
-                    for c in session.kvCache {
-                        if c.trim(trimAmount) == 0 {
-                            metrics.trimFailures += 1
-                            return freshCache(tokens: newTokens, model: model)
-                        }
-                    }
-                }
-                sessions[bestIdx].lastUsed = Date()
-                sessions[bestIdx].tokenIds = Array(newTokens[0..<bestPrefix])
-                let remaining = Array(newTokens[bestPrefix...])
-                let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
-                recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
-                return (session.kvCache, remaining, status, session.id)
-            }
             return freshCache(tokens: newTokens, model: model)
         }
 
@@ -441,6 +463,9 @@ actor ServerPromptCache {
         if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[idx].tokenIds = promptTokens + generatedTokens
             sessions[idx].lastUsed = Date()
+            let firstOff = sessions[idx].kvCache.first?.offset ?? -1
+            let attentionOff = sessions[idx].kvCache.first(where: { $0 is KVCacheSimple || $0 is TurboQuantKVCache || $0 is QuantizedKVCache })?.offset ?? -1
+            log("  save: session[\(idx)] tokenIds=\(sessions[idx].tokenIds.count) firstCacheOffset=\(firstOff) attentionOffset=\(attentionOff)")
         }
     }
 
@@ -933,6 +958,16 @@ final class SimpleHTTPServer {
                                body: "{\"error\":{\"message\":\"invalid request\",\"type\":\"invalid_request_error\",\"code\":400}}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
                     return
                 }
+                // Debug: dump the roles + message prefixes the client actually sent.
+                // Purpose: definitively separate "client bundling history" from
+                // "server KV-cache leak". If opencode's /new doesn't clear its
+                // conversation, prior user turns will show up here verbatim.
+                let msgSummary = request.messages.enumerated().map { (i, m) -> String in
+                    let c = m.content ?? ""
+                    let preview = c.count > 60 ? String(c.prefix(60)) + "…" : c
+                    return "[\(i)] \(m.role): \(preview.replacingOccurrences(of: "\n", with: "\\n"))"
+                }.joined(separator: " | ")
+                log("  chat messages (\(request.messages.count)): \(msgSummary)")
                 await handleChat(fd: fd, request: request, corsOrigin: corsOrigin)
 
             case ("GET", "/tokenizer_info"), ("GET", "/v1/tokenizer_info"):
