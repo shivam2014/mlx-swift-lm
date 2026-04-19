@@ -544,21 +544,31 @@ final class ServerSlot: @unchecked Sendable {
 /// instead, we get slot-level concurrency with the GPU command queue serializing
 /// the actual compute. Each active slot streams at ~1/N aggregate throughput.
 actor SlotManager {
-    let slots: [ServerSlot]
-    let slotCount: Int
+    // `slots` is now resizable via resize(to:). Slot IDs are stable across
+    // resize — new slots get fresh IDs past the current max, retired slots
+    // drop out once their current request completes.
+    private(set) var slots: [ServerSlot]
+    /// Slot IDs that should be removed from the pool on their next release —
+    /// used by resize(to:) when shrinking without interrupting live requests.
+    private var retiring: Set<Int> = []
+    /// Monotonic ID counter so resized-in slots never collide with retired IDs.
+    private var nextSlotId: Int
     private var slotWaiters: [CheckedContinuation<ServerSlot, Never>] = []
     // Prefill semaphore: only one slot prefills at a time to avoid GPU contention
     private var prefillBusy = false
     private var prefillWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(slotCount: Int) {
-        self.slotCount = slotCount
         var s: [ServerSlot] = []
         for i in 0..<slotCount {
             s.append(ServerSlot(id: i))
         }
         self.slots = s
+        self.nextSlotId = slotCount
     }
+
+    /// Current slot pool size (live — changes as resize() runs).
+    func slotCount() -> Int { slots.count }
 
     /// Acquire exclusive prefill access. Only one slot prefills at a time.
     func acquirePrefill() async {
@@ -582,9 +592,9 @@ actor SlotManager {
     }
 
     /// Acquire an idle slot. If all slots are busy, the caller suspends until
-    /// one becomes available (FIFO queue).
+    /// one becomes available (FIFO queue). Retiring slots are never handed out.
     func acquireSlot() async -> ServerSlot {
-        if let slot = slots.first(where: { $0.state == .idle }) {
+        if let slot = slots.first(where: { $0.state == .idle && !retiring.contains($0.id) }) {
             slot.state = .prefilling
             return slot
         }
@@ -594,9 +604,9 @@ actor SlotManager {
         }
     }
 
-    /// Try to acquire a slot without waiting. Returns nil if all busy (for 503 responses).
+    /// Try to acquire a slot without waiting. Returns nil if all busy.
     func tryAcquireSlot() -> ServerSlot? {
-        if let slot = slots.first(where: { $0.state == .idle }) {
+        if let slot = slots.first(where: { $0.state == .idle && !retiring.contains($0.id) }) {
             slot.state = .prefilling
             return slot
         }
@@ -604,7 +614,16 @@ actor SlotManager {
     }
 
     /// Release a slot back to idle and wake the next queued waiter, if any.
+    /// If the slot was marked retiring during shrink, remove it from the pool
+    /// instead of re-idling it.
     func releaseSlot(_ slot: ServerSlot) {
+        if retiring.contains(slot.id) {
+            retiring.remove(slot.id)
+            slots.removeAll { $0.id == slot.id }
+            log("slot[\(slot.id)] retired (pool now \(slots.count))")
+            // Don't hand this slot to a waiter — but if we have capacity, someone else can serve.
+            return
+        }
         slot.reset()
         if let waiter = slotWaiters.first {
             slotWaiters.removeFirst()
@@ -613,13 +632,85 @@ actor SlotManager {
         }
     }
 
+    /// Resize the slot pool without interrupting in-flight requests.
+    ///
+    /// Grow: append new idle slots (fresh IDs). If any callers are queued in
+    /// `slotWaiters`, hand them slots immediately.
+    ///
+    /// Shrink: pick `excess` slots to retire. Idle ones are removed immediately.
+    /// Busy ones are marked retiring and dropped on their next `releaseSlot`.
+    /// No request in progress is ever cancelled.
+    ///
+    /// Returns (oldCount, newCount, retiredNow, retiredPending).
+    func resize(to target: Int) -> (oldCount: Int, newCount: Int, retiredNow: Int, retiredPending: Int) {
+        let old = slots.count
+        let clamped = max(1, min(target, 16))
+        if clamped == old {
+            return (old, old, 0, retiring.count)
+        }
+
+        if clamped > old {
+            let toAdd = clamped - old
+            var wokeWaiters = 0
+            for _ in 0..<toAdd {
+                let s = ServerSlot(id: nextSlotId)
+                nextSlotId += 1
+                slots.append(s)
+                // Stagger: wake at most ONE queued waiter per resize call.
+                // Waking multiple waiters on the same tick triggered concurrent
+                // first-use MLX kernel compilation and fatal-errored on
+                // `g0_copybool_bfloat16` — even with startup warmup, it's safer
+                // to let the first new slot take one queued request and let
+                // future releases drain the rest at the existing serialized pace.
+                // Callers can invoke resize() again to wake more waiters.
+                if wokeWaiters == 0, let waiter = slotWaiters.first {
+                    slotWaiters.removeFirst()
+                    s.state = .prefilling
+                    waiter.resume(returning: s)
+                    wokeWaiters += 1
+                }
+            }
+            log("resize: grew \(old) → \(slots.count) (woke \(wokeWaiters) waiter, \(slotWaiters.count) remain queued)")
+            return (old, slots.count, 0, retiring.count)
+        }
+
+        // Shrink: retire `excess` slots, preferring idle first to free memory
+        // immediately. Busy ones stay live until their generate loop finishes.
+        var excess = old - clamped
+        var removedNow = 0
+        // Mark in two passes: idle first (drop immediately), then busy (mark retiring).
+        var i = slots.count - 1
+        while i >= 0 && excess > 0 {
+            let s = slots[i]
+            if s.state == .idle && !retiring.contains(s.id) {
+                log("slot[\(s.id)] retired immediately (was idle)")
+                slots.remove(at: i)
+                removedNow += 1
+                excess -= 1
+            }
+            i -= 1
+        }
+        i = slots.count - 1
+        while i >= 0 && excess > 0 {
+            let s = slots[i]
+            if !retiring.contains(s.id) {
+                retiring.insert(s.id)
+                log("slot[\(s.id)] marked retiring (busy — will drop on release)")
+                excess -= 1
+            }
+            i -= 1
+        }
+        log("resize: shrank \(old) → \(slots.count) (\(retiring.count) pending retirement)")
+        return (old, slots.count, removedNow, retiring.count)
+    }
+
     /// Get a snapshot of all slot states for the /slots endpoint.
-    func slotStatus() -> [(id: Int, state: String, requestId: String, promptTokens: Int, genTokens: Int, elapsed: Double)] {
+    func slotStatus() -> [(id: Int, state: String, requestId: String, promptTokens: Int, genTokens: Int, elapsed: Double, retiring: Bool)] {
         slots.map { slot in
             let elapsed = slot.state == .idle ? 0 : CFAbsoluteTimeGetCurrent() - slot.startTime
             return (id: slot.id, state: slot.state.rawValue, requestId: slot.requestId,
                     promptTokens: slot.promptTokenCount, genTokens: slot.generationTokenCount,
-                    elapsed: elapsed)
+                    elapsed: elapsed, retiring: retiring.contains(slot.id))
         }
     }
 
@@ -640,7 +731,6 @@ final class SimpleHTTPServer {
     let modelId: String
     let promptCache: ServerPromptCache
     let slotManager: SlotManager
-    let slotCount: Int
     private var serverSocket: Int32 = -1
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     static let maxBodySize = 10 * 1024 * 1024
@@ -659,12 +749,11 @@ final class SimpleHTTPServer {
         self.port = port
         self.container = container
         self.modelId = modelId
-        self.slotCount = slotCount
         let maxSess = SimpleHTTPServer.autoMaxSessions()
         self.promptCache = ServerPromptCache(maxSessions: maxSess, kvScheme: kvScheme)
         self.slotManager = SlotManager(slotCount: slotCount)
         log("Auto-configured: \(maxSess) max cached sessions (\(ProcessInfo.processInfo.physicalMemory / (1024*1024*1024))GB RAM)")
-        log("Parallel inference slots: \(slotCount)")
+        log("Parallel inference slots: \(slotCount) (resize at runtime via POST /admin/slots)")
         if let kv = kvScheme { log("KV cache scheme: \(kv)") }
     }
 
@@ -688,7 +777,7 @@ final class SimpleHTTPServer {
         guard listen(serverSocket, 64) == 0 else { throw ServerError.listen }
 
         log("Listening on http://127.0.0.1:\(port)")
-        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /tokenizer_info, POST /tokenize, GET /metrics, GET /slots")
+        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /tokenizer_info, POST /tokenize, GET /metrics, GET /slots, POST /admin/slots")
 
         // Monitor macOS memory pressure — evict idle sessions under pressure
         let source = DispatchSource.makeMemoryPressureSource(
@@ -869,18 +958,40 @@ final class SimpleHTTPServer {
                 let sc = await promptCache.getSessionCount()
                 let activeSlots = await slotManager.activeSlotCount()
                 let queueDepth = await slotManager.queueDepth()
+                let totalSlots = await slotManager.slotCount()
                 let body = """
-                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(await promptCache.maxSessions)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))},"slots":{"total":\(slotCount),"active":\(activeSlots),"queue_depth":\(queueDepth)}}
+                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(await promptCache.maxSessions)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))},"slots":{"total":\(totalSlots),"active":\(activeSlots),"queue_depth":\(queueDepth)}}
                 """
                 sendResponse(fd: fd, status: 200, body: body.trimmingCharacters(in: .whitespacesAndNewlines), contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("GET", "/slots"):
                 let status = await slotManager.slotStatus()
                 let slotsJSON = status.map { s in
-                    "{\"id\":\(s.id),\"state\":\"\(s.state)\",\"request_id\":\"\(s.requestId)\",\"prompt_tokens\":\(s.promptTokens),\"generation_tokens\":\(s.genTokens),\"elapsed_ms\":\(String(format:"%.0f",s.elapsed * 1000))}"
+                    "{\"id\":\(s.id),\"state\":\"\(s.state)\",\"request_id\":\"\(s.requestId)\",\"prompt_tokens\":\(s.promptTokens),\"generation_tokens\":\(s.genTokens),\"elapsed_ms\":\(String(format:"%.0f",s.elapsed * 1000)),\"retiring\":\(s.retiring)}"
                 }.joined(separator: ",")
                 let qd = await slotManager.queueDepth()
                 let body = "{\"slots\":[\(slotsJSON)],\"queue_depth\":\(qd)}"
+                sendResponse(fd: fd, status: 200, body: body, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
+
+            case ("POST", "/admin/slots"):
+                // Runtime resize of the inference-slot pool. No restart required,
+                // no in-flight requests cancelled: shrink marks excess slots to
+                // retire on their next release, grow adds new idle slots and
+                // wakes queued waiters.
+                //
+                // Body: {"count": N}  (clamped to 1..16)
+                // Response: {"old": X, "new": Y, "retired_now": A, "retired_pending": B}
+                guard let data = bodyStr.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let count = json["count"] as? Int else {
+                    sendResponse(fd: fd, status: 400,
+                               body: "{\"error\":{\"message\":\"expected body {\\\"count\\\":N}\",\"type\":\"invalid_request_error\",\"code\":400}}",
+                               contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
+                    return
+                }
+                let result = await slotManager.resize(to: count)
+                let body = "{\"old\":\(result.oldCount),\"new\":\(result.newCount),\"retired_now\":\(result.retiredNow),\"retired_pending\":\(result.retiredPending)}"
+                log("admin: resize requested \(count) → pool \(result.oldCount) → \(result.newCount) (now=\(result.retiredNow), pending=\(result.retiredPending))")
                 sendResponse(fd: fd, status: 200, body: body, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("OPTIONS", _):
@@ -911,7 +1022,7 @@ final class SimpleHTTPServer {
         let slot = await slotManager.acquireSlot()
         slot.requestId = requestId
         slot.startTime = CFAbsoluteTimeGetCurrent()
-        log("slot[\(slot.id)] acquired for \(requestId) (active: \(await slotManager.activeSlotCount())/\(slotCount))")
+        log("slot[\(slot.id)] acquired for \(requestId) (active: \(await slotManager.activeSlotCount())/\(await slotManager.slotCount()))")
 
         // Serialize prefill: only one request prefills at a time to avoid GPU contention.
         // Acquired here (before any model access), released on first generated token.
@@ -1748,6 +1859,40 @@ struct MLXServerApp {
                 configuration: config) { p in
                 if p.fractionCompleted > 0.99 { log("Model loaded (VLM)") }
             }
+        }
+
+        // Warm up Metal kernels BEFORE accepting traffic.
+        // MLX-Swift lazily compiles Metal shaders on first use; under concurrent
+        // decode that can race and crash with "Unable to load kernel
+        // g0_copybool_bfloat16" (transforms.cpp:73). Running one short prefill +
+        // decode forces the common kernel path (attention mask cast, SDPA,
+        // rotary embeddings, MLP, optional TurboQuant ops) to compile serially.
+        // Empirically ~1-3 seconds, worth it to avoid crashes on the first
+        // concurrent burst.
+        do {
+            log("Warming up model kernels...")
+            let ctx = await container.perform { ctx in ctx }
+            let kvParams = kvScheme.map { GenerateParameters(kvScheme: $0) }
+            let cache = ctx.model.newCache(parameters: kvParams)
+            let tokens = ctx.tokenizer.encode(text: "hello", addSpecialTokens: true)
+            let input = LMInput(text: LMInput.Text(tokens: MLXArray(tokens.isEmpty ? [0] : tokens)))
+            var params = GenerateParameters(temperature: 0.0)
+            if let kv = kvScheme { params = GenerateParameters(kvScheme: kv); params.temperature = 0.0 }
+            params.maxTokens = 4
+            var n = 0
+            let start = CFAbsoluteTimeGetCurrent()
+            for try await gen in try generate(input: input, cache: cache, parameters: params, context: ctx) {
+                if case .chunk = gen {
+                    n += 1
+                    if n >= 2 { break }
+                }
+            }
+            let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            log("Warmup complete: \(n) tokens in \(ms)ms")
+        } catch {
+            // Non-fatal — if warmup fails, production requests will compile
+            // kernels themselves. Log loudly so we can investigate.
+            log("Warmup FAILED: \(error) — continuing anyway, first real request may crash")
         }
 
         let server = SimpleHTTPServer(port: port, container: container, modelId: model, slotCount: slots, kvScheme: kvScheme)
