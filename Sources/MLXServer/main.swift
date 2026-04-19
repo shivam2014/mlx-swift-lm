@@ -6,7 +6,100 @@ import MLXLMCommon
 import MLXNN
 
 func log(_ msg: String) {
-    FileHandle.standardError.write(Data("[MLXServer] \(msg)\n".utf8))
+    FileHandle.standardOutput.write(Data("[MLXServer] \(msg)\n".utf8))
+}
+
+// MARK: - I/O helpers
+
+/// Loop-guarded write to a socket fd. Returns true if `bytes` was fully written,
+/// false if the peer disconnected or an unrecoverable error occurred. Handles
+/// EINTR and partial writes so SSE frames and HTTP bodies can't silently truncate.
+@discardableResult
+func writeAll(_ fd: Int32, _ bytes: UnsafePointer<UInt8>, _ count: Int) -> Bool {
+    var remaining = count
+    var ptr = bytes
+    while remaining > 0 {
+        let n = write(fd, ptr, remaining)
+        if n > 0 {
+            remaining -= n
+            ptr = ptr.advanced(by: n)
+        } else if n < 0 {
+            if errno == EINTR { continue }
+            return false  // EPIPE / ECONNRESET / EAGAIN (blocking socket) / etc.
+        } else {
+            return false  // write returning 0 is effectively EOF
+        }
+    }
+    return true
+}
+
+@discardableResult
+func writeAll(_ fd: Int32, _ s: String) -> Bool {
+    var data = Data(s.utf8)
+    return data.withUnsafeMutableBytes { raw -> Bool in
+        guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+        return writeAll(fd, base, raw.count)
+    }
+}
+
+/// Loop-guarded read. Handles EINTR. Returns bytes read, 0 on EOF, -1 on error.
+func readAll(_ fd: Int32, _ buf: UnsafeMutablePointer<UInt8>, _ count: Int) -> Int {
+    var remaining = count
+    var ptr = buf
+    var total = 0
+    while remaining > 0 {
+        let n = read(fd, ptr, remaining)
+        if n > 0 {
+            total += n
+            remaining -= n
+            ptr = ptr.advanced(by: n)
+        } else if n == 0 {
+            return total  // EOF
+        } else {
+            if errno == EINTR { continue }
+            return -1
+        }
+    }
+    return total
+}
+
+/// JSON string-escape per RFC 8259 — handles backslash, quotes, all control
+/// chars < 0x20 (including \b \f \n \r \t), and leaves other UTF-8 intact.
+/// Model output can contain embedded control chars that break hand-rolled escapes.
+func jsonEscape(_ s: String) -> String {
+    var out = ""
+    out.reserveCapacity(s.utf8.count + 2)
+    for scalar in s.unicodeScalars {
+        switch scalar {
+        case "\"": out += "\\\""
+        case "\\": out += "\\\\"
+        case "\u{08}": out += "\\b"
+        case "\u{09}": out += "\\t"
+        case "\u{0A}": out += "\\n"
+        case "\u{0C}": out += "\\f"
+        case "\u{0D}": out += "\\r"
+        default:
+            if scalar.value < 0x20 {
+                out += String(format: "\\u%04x", scalar.value)
+            } else {
+                out.unicodeScalars.append(scalar)
+            }
+        }
+    }
+    return out
+}
+
+/// Configure a freshly-accepted client socket: low-latency SSE (TCP_NODELAY),
+/// receive/send timeouts to prevent slow-loris from hogging slots, and keepalive.
+func configureClientSocket(_ fd: Int32, recvTimeoutSec: Int = 60, sendTimeoutSec: Int = 30) {
+    var one: Int32 = 1
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, socklen_t(MemoryLayout<Int32>.size))
+
+    var rcv = timeval(tv_sec: recvTimeoutSec, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, socklen_t(MemoryLayout<timeval>.size))
+    var snd = timeval(tv_sec: sendTimeoutSec, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, socklen_t(MemoryLayout<timeval>.size))
 }
 
 // MARK: - OpenAI Types
@@ -192,6 +285,10 @@ struct CacheMetrics {
 
 actor ServerPromptCache {
     var sessions: [CachedSession] = []
+    /// Sessions currently being mutated by an active generate loop. Eviction and
+    /// flush skip these; without this guard, a concurrent request could evict the
+    /// KV cache that another task is writing into, corrupting memory.
+    private var inUse: Set<UUID> = []
     let maxSessions: Int
     var metrics = CacheMetrics()
     let kvScheme: String?
@@ -200,6 +297,9 @@ actor ServerPromptCache {
         self.maxSessions = maxSessions
         self.kvScheme = kvScheme
     }
+
+    func markInUse(_ id: UUID) { inUse.insert(id) }
+    func markIdle(_ id: UUID) { inUse.remove(id) }
 
     func recordRequest(hit: Bool, prefillTokens: Int, reusedTokens: Int) {
         metrics.totalRequests += 1
@@ -262,27 +362,13 @@ actor ServerPromptCache {
                 recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
                 return (session.kvCache, remaining, status, session.id)
             } else {
-                // Different conversation forking from this prefix — deep copy
-                let copiedCache = session.kvCache.map { $0.copy() }
-                if trimAmount > 0 {
-                    for c in copiedCache {
-                        if c.trim(trimAmount) == 0 {
-                            metrics.trimFailures += 1
-                            return freshCache(tokens: newTokens, model: model)
-                        }
-                    }
-                }
-
-                evictIfNeeded()
-                let newSession = CachedSession(tokenIds: Array(newTokens[0..<bestPrefix]),
-                                               kvCache: copiedCache, lastUsed: Date())
-                sessions.append(newSession)
-                sessions[bestIdx].lastUsed = Date()
-
-                let remaining = Array(newTokens[bestPrefix...])
-                let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
-                recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
-                return (copiedCache, remaining, status, newSession.id)
+                // Divergent tail: DO NOT reuse. Observed leak with TurboQuantKVCache
+                // where trim-in-place leaves compressed K/V state that the attention
+                // path reads despite offset having moved down — content from the
+                // prior conversation's post-prefix tokens bled into responses to
+                // unrelated system prompts. The shared-prefix optimization for
+                // divergent conversations isn't worth correctness risk. Start fresh.
+                return freshCache(tokens: newTokens, model: model)
             }
         }
 
@@ -301,39 +387,72 @@ actor ServerPromptCache {
     }
 
     /// Save token state after generation completes.
-    func save(sessionId: UUID, tokens: [Int]) {
+    ///
+    /// `promptTokens` is required; `generatedTokens` should hold the token IDs
+    /// actually produced by generate() for maximum cache reuse — the next request
+    /// will re-tokenize the assistant reply and try to match a longer prefix.
+    /// Correctness does not depend on `generatedTokens` being populated, since
+    /// `fetch()` reads `actualCacheSize` from the live KV cache offset; passing
+    /// `[]` just means the next request won't reuse the KV for the assistant
+    /// turn and will trim+reprefill that region.
+    func save(sessionId: UUID, promptTokens: [Int], generatedTokens: [Int] = []) {
         if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
-            sessions[idx].tokenIds = tokens
+            sessions[idx].tokenIds = promptTokens + generatedTokens
             sessions[idx].lastUsed = Date()
         }
     }
 
+    /// Pick the index of the oldest evictable (idle) session, or nil if none.
+    /// In-use sessions are skipped so concurrent requests can't corrupt each
+    /// other's KV state.
+    private func oldestIdleIndex() -> Int? {
+        var bestIdx: Int? = nil
+        var bestDate = Date.distantFuture
+        for (i, s) in sessions.enumerated() where !inUse.contains(s.id) {
+            if s.lastUsed < bestDate {
+                bestDate = s.lastUsed
+                bestIdx = i
+            }
+        }
+        return bestIdx
+    }
+
     private func evictIfNeeded() {
         while sessions.count >= maxSessions {
-            if let oldest = sessions.enumerated().min(by: { $0.element.lastUsed < $1.element.lastUsed }) {
-                log("Evicting session \(oldest.offset) (\(oldest.element.tokenIds.count) tokens, idle \(Int(-oldest.element.lastUsed.timeIntervalSinceNow))s)")
-                sessions.remove(at: oldest.offset)
+            guard let idx = oldestIdleIndex() else {
+                // All sessions busy — nothing safe to evict. The new freshCache
+                // caller will append past maxSessions; better a brief capacity
+                // overshoot than a use-after-free.
+                log("evictIfNeeded: all \(sessions.count) sessions in use, skipping")
+                return
             }
+            let s = sessions[idx]
+            log("Evicting session \(idx) (\(s.tokenIds.count) tokens, idle \(Int(-s.lastUsed.timeIntervalSinceNow))s)")
+            sessions.remove(at: idx)
+            metrics.evictions += 1
         }
     }
 
-    /// Evict idle sessions, keeping at most `keep` sessions.
+    /// Evict idle sessions, keeping at most `keep` sessions. Skips in-use.
     func evictIdle(keep: Int) {
         while sessions.count > keep {
-            if let oldest = sessions.enumerated().min(by: { $0.element.lastUsed < $1.element.lastUsed }) {
-                log("Memory pressure eviction: session \(oldest.offset) (\(oldest.element.tokenIds.count) tokens)")
-                sessions.remove(at: oldest.offset)
-                metrics.evictions += 1
-            }
+            guard let idx = oldestIdleIndex() else { return }
+            let s = sessions[idx]
+            log("Memory pressure eviction: session \(idx) (\(s.tokenIds.count) tokens)")
+            sessions.remove(at: idx)
+            metrics.evictions += 1
         }
     }
 
-    /// Flush all cached sessions (e.g., on model change or critical memory pressure)
+    /// Flush idle sessions (e.g., on critical memory pressure). In-use sessions
+    /// stay — killing them mid-generate would mutate KV that a live task is
+    /// iterating. Once those tasks finish (markIdle), a subsequent flush clears them.
     func flush() {
-        let count = sessions.count
-        sessions.removeAll()
-        metrics.evictions += count
-        log("Flushed all \(count) cached sessions")
+        let before = sessions.count
+        sessions.removeAll(where: { !inUse.contains($0.id) })
+        let freed = before - sessions.count
+        metrics.evictions += freed
+        log("Flushed \(freed) idle cached sessions (\(sessions.count) in-use retained)")
     }
 
     private func commonPrefix(_ a: [Int], _ b: [Int]) -> Int {
@@ -569,7 +688,16 @@ final class SimpleHTTPServer {
 
         while true {
             let client = accept(serverSocket, nil, nil)
-            guard client >= 0 else { continue }
+            if client < 0 {
+                let err = errno
+                if err == EINTR { continue }
+                // EMFILE / ENFILE / ENOBUFS etc. — don't spin at 100% CPU while
+                // the system recovers. Brief sleep lets some fds free up.
+                log("accept failed: errno=\(err)")
+                usleep(10_000)
+                continue
+            }
+            configureClientSocket(client)
             Task { await handleClient(client) }
         }
     }
@@ -588,13 +716,18 @@ final class SimpleHTTPServer {
             var byte: UInt8 = 0
             while headerData.count < 65536 {
                 let n = read(fd, &byte, 1)
-                guard n == 1 else { return }
-                headerData.append(byte)
-                // Detect end of headers: \r\n\r\n
-                if headerData.count >= 4 &&
-                   headerData[headerData.count-4] == 0x0D && headerData[headerData.count-3] == 0x0A &&
-                   headerData[headerData.count-2] == 0x0D && headerData[headerData.count-1] == 0x0A {
-                    break
+                if n == 1 {
+                    headerData.append(byte)
+                    // Detect end of headers: \r\n\r\n
+                    if headerData.count >= 4 &&
+                       headerData[headerData.count-4] == 0x0D && headerData[headerData.count-3] == 0x0A &&
+                       headerData[headerData.count-2] == 0x0D && headerData[headerData.count-1] == 0x0A {
+                        break
+                    }
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    return  // EOF or unrecoverable error
                 }
             }
 
@@ -637,9 +770,20 @@ final class SimpleHTTPServer {
                 while remaining > 0 {
                     let toRead = min(remaining, buf.count)
                     let n = read(fd, &buf, toRead)
-                    guard n > 0 else { break }
-                    bodyData.append(contentsOf: buf[0..<n])
-                    remaining -= n
+                    if n > 0 {
+                        bodyData.append(contentsOf: buf[0..<n])
+                        remaining -= n
+                    } else if n < 0 && errno == EINTR {
+                        continue
+                    } else {
+                        // Short read on a Content-Length-declared body is a hard error.
+                        // Handing a truncated JSON to the decoder would produce a
+                        // confusing 400; return a clearer 400 now.
+                        sendResponse(fd: fd, status: 400,
+                                   body: "{\"error\":{\"message\":\"truncated request body (\(contentLength - remaining)/\(contentLength) bytes)\",\"type\":\"invalid_request_error\",\"code\":400}}",
+                                   contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
+                        return
+                    }
                 }
             }
             let bodyStr = String(data: bodyData, encoding: .utf8) ?? ""
@@ -727,8 +871,9 @@ final class SimpleHTTPServer {
             }
         } catch {
             log("ERROR handling \(method) \(path): \(error)")
+            let msg = jsonEscape(error.localizedDescription)
             sendResponse(fd: fd, status: 500,
-                       body: "{\"error\":{\"message\":\"internal server error\",\"type\":\"server_error\",\"code\":500}}",
+                       body: "{\"error\":{\"message\":\"\(msg)\",\"type\":\"server_error\",\"code\":500}}",
                        contentType: "application/json; charset=utf-8", corsOrigin: originHeader ?? "*")
         }
 
@@ -745,7 +890,6 @@ final class SimpleHTTPServer {
         slot.requestId = requestId
         slot.startTime = CFAbsoluteTimeGetCurrent()
         log("slot[\(slot.id)] acquired for \(requestId) (active: \(await slotManager.activeSlotCount())/\(slotCount))")
-        defer { Task { await slotManager.releaseSlot(slot) } }
 
         // Serialize prefill: only one request prefills at a time to avoid GPU contention.
         // Acquired here (before any model access), released on first generated token.
@@ -757,6 +901,17 @@ final class SimpleHTTPServer {
                 await slotManager.releasePrefill()
             }
         }
+
+        // Session ID becomes known after fetch(); track in-use so concurrent
+        // eviction/flush can't pull the cache out from under the generate loop.
+        var markedSessionId: UUID? = nil
+        // Keepalive timer (streaming only). Must be nil-safe at every cleanup point.
+        var keepaliveTimer: DispatchSourceTimer? = nil
+
+        // All resources acquired above MUST be released before return, not via
+        // `defer { Task { await ... } }` — a detached Task leaks the release
+        // past the function return so the next `acquireSlot()` sees the slot
+        // still in use. Cleanup is awaited inline in all exit paths.
 
         do {
             slot.state = .prefilling
@@ -796,9 +951,15 @@ final class SimpleHTTPServer {
                     }
                     return tool.mapValues { convert($0) } as [String: any Sendable]
                 }
+                // Pass preserve_thinking=true so the Qwen3.6 template emits
+                // deterministic <think> blocks for historical assistant turns,
+                // avoiding prompt-prefix drift and cache invalidation on tool-heavy
+                // agentic workloads. See:
+                // https://www.reddit.com/r/LocalLLaMA/comments/1sg076h/
+                let templateCtx: [String: any Sendable] = ["preserve_thinking": true]
                 // Try with tools first; fall back to without if template doesn't support them
                 do {
-                    tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+                    tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs, additionalContext: templateCtx)
                 } catch {
                     log("Chat template with tools failed (\(error)), retrying without tools")
                     // Inject tool descriptions into system prompt instead
@@ -814,17 +975,19 @@ final class SimpleHTTPServer {
                         sys["content"] = (sys["content"] ?? "") + "\n\n" + toolDesc
                         var adjusted = messages
                         adjusted[0] = sys
-                        tokens = try ctx.tokenizer.applyChatTemplate(messages: adjusted)
+                        tokens = try ctx.tokenizer.applyChatTemplate(messages: adjusted, tools: nil, additionalContext: templateCtx)
                     } else {
                         var adjusted = messages
                         adjusted.insert(["role": "system", "content": toolDesc], at: 0)
-                        tokens = try ctx.tokenizer.applyChatTemplate(messages: adjusted)
+                        tokens = try ctx.tokenizer.applyChatTemplate(messages: adjusted, tools: nil, additionalContext: templateCtx)
                     }
                 }
             } else {
                 // Qwen 3.6: let the chat template's TAG_think prompt handle thinking mode.
                 // Passing enable_thinking=true causes double-enable conflict → HTTP 400.
-                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: nil)
+                // preserve_thinking=true stabilizes history rendering across turns for cache reuse.
+                let templateCtx: [String: any Sendable] = ["preserve_thinking": true]
+                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: nil, additionalContext: templateCtx)
             }
             // If chat template injected <think> as assistant prefix, model outputs thinking
             // content directly (no opening <think> tag in response, only closing </think>).
@@ -834,8 +997,19 @@ final class SimpleHTTPServer {
             log("  think detection: lastTokensText=\(lastTokensText.debugDescription) prefillsThink=\(promptPrefillsThink)")
             // Prompt caching: reuse KV state from previous requests
             let prefillStart = CFAbsoluteTimeGetCurrent()
-            let (reusedCache, newTokens, cacheStatus, sessionId) = await promptCache.fetch(tokens: tokens, model: ctx.model)
-            let tokenArray = MLXArray(newTokens.isEmpty ? tokens : newTokens)
+            let (reusedCache, fetchedNewTokens, cacheStatus, sessionId) = await promptCache.fetch(tokens: tokens, model: ctx.model)
+            await promptCache.markInUse(sessionId)
+            markedSessionId = sessionId
+
+            // If the cache fully matched (newTokens empty), trim one slot so the
+            // model has a seed token to decode from. Without this we'd pass the
+            // entire prompt to generate(), defeating the cache hit entirely.
+            var newTokens = fetchedNewTokens
+            if newTokens.isEmpty, let last = tokens.last {
+                for c in reusedCache { _ = c.trim(1) }
+                newTokens = [last]
+            }
+            let tokenArray = MLXArray(newTokens)
             let input = LMInput(text: LMInput.Text(tokens: tokenArray))
 
             var params = GenerateParameters(temperature: request.temperature ?? 0.6)
@@ -843,7 +1017,9 @@ final class SimpleHTTPServer {
                 params.maxTokens = maxTokens
             }
 
-            // Set tool call format if tools are present
+            // Tool-call format is applied per-request via the ctx copy; generate()
+            // uses `context: ctx` so the mutation only affects this request's
+            // inference path, not a global shared configuration.
             if toolsAny != nil {
                 ctx.configuration.toolCallFormat = .xmlFunction
             }
@@ -852,197 +1028,214 @@ final class SimpleHTTPServer {
             slot.state = .generating
             log("slot[\(slot.id)] \(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0) think_prefilled=\(promptPrefillsThink)")
 
-            // Always send keepalives for streaming to prevent client ReadTimeout
-            // during prefill (bridge init + forward pass can take 10-100s for MoE models)
-            // Keepalive timer: sends real SSE data chunks every 2s during prefill
-            // to prevent client ReadTimeout. Uses GCD (not async Task) because
-            // generate() blocks the cooperative thread pool during GPU inference.
-            var keepaliveTimer: DispatchSourceTimer? = nil
             if isStreaming {
+                // SSE response headers
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\r\n"
-                _ = header.withCString { write(fd, $0, Int(strlen($0))) }
+                if !writeAll(fd, header) {
+                    // Client already gone — bail out, cleanup will run below.
+                    throw ServerError.clientDisconnected
+                }
 
+                // Keepalive: send an SSE heartbeat every 2s while prefill runs so
+                // the client's read timer stays alive. Cancelled as soon as the
+                // first real token arrives, and re-cancelled again in cleanup.
                 let timer = DispatchSource.makeTimerSource(queue: .global())
                 let keepaliveFd = fd
                 timer.schedule(deadline: .now() + 2, repeating: 2.0)
                 timer.setEventHandler {
                     let chunk = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n"
-                    _ = chunk.withCString { write(keepaliveFd, $0, Int(strlen($0))) }
+                    writeAll(keepaliveFd, chunk)
                 }
                 timer.resume()
                 keepaliveTimer = timer
             }
 
             if isStreaming {
-                var prefillDone = false
-
                 let reqModel = request.model
                 var hadToolCall = false
-                // Send role chunk immediately so client knows we're alive (content:null per OpenAI spec)
+                // Role chunk announces the assistant role immediately (OpenAI spec).
                 writeSSE(fd: fd, requestId: requestId, role: "assistant", content: nil, finishReason: nil, requestModel: reqModel, includeNullContent: true)
-                // Flush immediately
-                _ = "".withCString { _ in fcntl(fd, F_FULLFSYNC) }
+
+                // Streaming state, tracked with String.Index for O(1) advancement.
+                // `fullText` is append-only (never mutated) so indices stay valid.
+                // `unemittedIdx` is where the next not-yet-emitted text starts.
+                // `thinkEmitIdx` tracks emitted reasoning within the think block.
+                var fullText = ""
+                var unemittedIdx = fullText.startIndex
+                var thinkStartIdx = fullText.startIndex  // start of think content (after <think>)
+                var thinkEmitIdx = fullText.startIndex   // how far we've emitted reasoning
+                var inThinkBlock = promptPrefillsThink
+                var thinkBlockResolved = false  // true once we've seen </think> and switched to content
+
+                // Tag prefixes that require holdback while the rest of the tag arrives.
+                let tagPrefixes = ["<tool_call", "<function=", "<minimax:", "<invoke", "</think", "<think", "<parameter"]
+
+                func unemitted() -> Substring { fullText[unemittedIdx...] }
 
                 do {
-                    // Accumulate ALL text, parse tool calls at the end.
-                    // Streaming text is emitted in real-time UNLESS we detect the
-                    // start of a tool call, at which point we buffer until complete.
-                    // For thinking models: send <think> content as reasoning_content delta.
-                    var fullText = ""
-                    var thinkText = ""  // accumulated think block content
-                    var emittedUpTo = 0  // index in fullText that we've already sent
-                    var inThinkBlock = promptPrefillsThink
-
                     var tokenCount = 0
                     for try await generation in try generate(
                         input: input, cache: reusedCache, parameters: params, context: ctx
                     ) {
-                        if !prefillDone {
-                            prefillDone = true
-                            keepaliveTimer?.cancel()
-                            await releasePrefillOnce()
-                            log("  first token arrived, prefill done")
-                        }
                         tokenCount += 1
 
                         switch generation {
                         case .chunk(let text):
                             fullText += text
+                            // Prefill is done once a real text token arrives (not .info).
+                            // Release the GPU prefill lock and cancel the keepalive timer.
+                            if !prefillReleased {
+                                keepaliveTimer?.cancel(); keepaliveTimer = nil
+                                await releasePrefillOnce()
+                                log("  first token arrived, prefill done")
+                            }
                             if tokenCount <= 3 || tokenCount % 50 == 0 {
-                                log("  chunk[\(tokenCount)]: +\(text.count)ch fullText=\(fullText.count)ch emitted=\(emittedUpTo) think=\(inThinkBlock)")
+                                log("  chunk[\(tokenCount)]: +\(text.count)ch fullText=\(fullText.count)ch think=\(inThinkBlock)")
                             }
 
-                            // Handle <think>...</think> blocks from thinking models.
-                            // Handles <think>...</think> and bare </think> (opening consumed by template).
-                            // Must run before tool-call holdback to avoid `<` in </think> being buffered.
-                            if emittedUpTo == 0 && !inThinkBlock {
-                                // Check if response starts with thinking content
-                                let trimmed = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if trimmed.hasPrefix("<think") || trimmed.hasPrefix("</think") {
+                            // -------- Think-block handling --------
+                            // Detect opening <think> at the very start of output, if
+                            // the prompt template didn't already prefill it.
+                            if !inThinkBlock && !thinkBlockResolved {
+                                let lead = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if lead.hasPrefix("<think") || lead.hasPrefix("</think") {
                                     inThinkBlock = true
+                                    if let open = fullText.range(of: "<think>") {
+                                        thinkStartIdx = open.upperBound
+                                        thinkEmitIdx = thinkStartIdx
+                                    } else {
+                                        thinkStartIdx = fullText.startIndex
+                                        thinkEmitIdx = fullText.startIndex
+                                    }
                                 }
                             }
                             if inThinkBlock {
-                                if fullText.contains("</think>") {
+                                if let close = fullText.range(of: "</think>") {
+                                    // End of think block: flush any remaining reasoning, then advance
+                                    // to post-think content.
+                                    let thinkEnd = close.lowerBound
+                                    if thinkEmitIdx < thinkEnd {
+                                        let reasoning = String(fullText[thinkEmitIdx..<thinkEnd])
+                                        if !reasoning.isEmpty {
+                                            writeSSE(fd: fd, requestId: requestId, role: nil, content: nil, finishReason: nil, reasoningContent: reasoning, requestModel: reqModel)
+                                        }
+                                    }
+                                    thinkEmitIdx = thinkEnd
+                                    inThinkBlock = false
+                                    thinkBlockResolved = true
+                                    unemittedIdx = close.upperBound
                                     log("  think block ended, fullText=\(fullText.count)ch")
-                                    if let range = fullText.range(of: "</think>") {
-                                        // Extract think content (strip the <think> tag itself)
-                                        var thinkContent = String(fullText[..<range.lowerBound])
-                                        if let tagEnd = thinkContent.range(of: "<think>") {
-                                            thinkContent = String(thinkContent[tagEnd.upperBound...])
-                                        }
-                                        // Send any remaining think content as reasoning_content
-                                        let newThink = thinkContent.count > thinkText.count ? String(thinkContent[thinkContent.index(thinkContent.startIndex, offsetBy: thinkText.count)...]) : ""
-                                        if !newThink.isEmpty {
-                                            writeSSE(fd: fd, requestId: requestId, role: nil, content: nil, finishReason: nil, reasoningContent: newThink, requestModel: reqModel)
-                                        }
-                                        thinkText = thinkContent
-
-                                        let afterThink = String(fullText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                                        fullText = afterThink
-                                        emittedUpTo = 0
-                                        inThinkBlock = false
-                                        if fullText.isEmpty { continue }
-                                    }
                                 } else {
-                                    // Still in think block -- stream as reasoning_content
-                                    // Extract think content so far (strip <think> tag)
-                                    var thinkContent = fullText
-                                    if let tagEnd = thinkContent.range(of: "<think>") {
-                                        thinkContent = String(thinkContent[tagEnd.upperBound...])
-                                    }
-                                    // Send only new think tokens
-                                    let newThink = thinkContent.count > thinkText.count ? String(thinkContent[thinkContent.index(thinkContent.startIndex, offsetBy: thinkText.count)...]) : ""
-                                    if !newThink.isEmpty {
-                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: nil, finishReason: nil, reasoningContent: newThink, requestModel: reqModel)
-                                        thinkText = thinkContent
+                                    // Still in think: stream new reasoning, do nothing else.
+                                    if thinkEmitIdx < fullText.endIndex {
+                                        let reasoning = String(fullText[thinkEmitIdx...])
+                                        if !reasoning.isEmpty {
+                                            writeSSE(fd: fd, requestId: requestId, role: nil, content: nil, finishReason: nil, reasoningContent: reasoning, requestModel: reqModel)
+                                            thinkEmitIdx = fullText.endIndex
+                                        }
                                     }
                                     continue
                                 }
                             }
 
-                            // After tool calls, suppress any trailing XML tags
+                            // Skip leading whitespace once content begins, to avoid
+                            // a lone "\n" from the template bleeding into output.
+                            if unemittedIdx < fullText.endIndex {
+                                let u = unemitted()
+                                if let firstNonWS = u.firstIndex(where: { !$0.isWhitespace }) {
+                                    if firstNonWS != u.startIndex {
+                                        unemittedIdx = firstNonWS
+                                    }
+                                } else {
+                                    // All whitespace so far — wait for more
+                                    continue
+                                }
+                            }
+
+                            // After a tool call has been emitted, swallow any trailing XML
+                            // closers so they don't appear as content.
                             if hadToolCall {
-                                // Strip any remaining XML closing tags from post-tool-call text
-                                let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
-                                let stripped = remaining
+                                let u = unemitted()
+                                let stripped = String(u)
                                     .replacingOccurrences(of: "</minimax:tool_call>", with: "")
                                     .replacingOccurrences(of: "</invoke>", with: "")
                                     .replacingOccurrences(of: "</tool_call>", with: "")
                                     .trimmingCharacters(in: .whitespacesAndNewlines)
                                 if stripped.isEmpty {
-                                    emittedUpTo = fullText.count
+                                    unemittedIdx = fullText.endIndex
                                     continue
                                 }
                             }
 
-                            // Skip leading whitespace after think-block removal
-                            if emittedUpTo == 0 && !fullText.isEmpty {
-                                let trimmed = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if trimmed.isEmpty { continue }
-                                if trimmed.count < fullText.count {
-                                    fullText = trimmed
-                                }
-                            }
-
-                            // Check if there's a potential tool call starting in the un-emitted portion
-                            let unemitted = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
-
-                            if unemitted.contains("<tool_call>") || unemitted.contains("<function=") || unemitted.contains("<minimax:tool_call>") || unemitted.contains("<invoke name=") {
-                                // Might be a tool call — check if it's complete
-                                if unemitted.contains("</tool_call>") || unemitted.contains("</function>") || unemitted.contains("</minimax:tool_call>") || unemitted.contains("</invoke>") {
-                                    // Complete tool call — parse and emit
-                                    let tcs = parseAllToolCalls(unemitted)
+                            // Tool-call detection on unemitted tail.
+                            let u = unemitted()
+                            let containsToolOpen = u.contains("<tool_call>") || u.contains("<function=") || u.contains("<minimax:tool_call>") || u.contains("<invoke name=")
+                            if containsToolOpen {
+                                let containsToolClose = u.contains("</tool_call>") || u.contains("</function>") || u.contains("</minimax:tool_call>") || u.contains("</invoke>")
+                                if containsToolClose {
+                                    let snippet = String(u)
+                                    let tcs = parseAllToolCalls(snippet)
                                     if !tcs.isEmpty {
                                         hadToolCall = true
                                         for tc in tcs {
                                             emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
                                         }
                                     } else {
-                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil, requestModel: reqModel)
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: snippet, finishReason: nil, requestModel: reqModel)
                                     }
-                                    emittedUpTo = fullText.count
+                                    unemittedIdx = fullText.endIndex
                                 }
-                                // Incomplete — keep buffering, don't emit
-                            } else if unemitted.contains("<") {
-                                // Hold back only if `<` looks like start of a known tag.
-                                // Don't hold back for comparison operators (x < y) or random `<`.
-                                let tagPrefixes = ["<tool_call", "<function=", "<minimax:", "<invoke", "</think", "<think", "<parameter"]
-                                let hasTagStart = tagPrefixes.contains(where: { unemitted.contains($0) })
-                                if hasTagStart {
-                                    // Emit everything before the tag start, hold the rest
-                                    if let ltIdx = unemitted.lastIndex(of: "<") {
-                                        let safe = String(unemitted[unemitted.startIndex..<ltIdx])
+                                // incomplete — wait for </...>
+                                continue
+                            }
+
+                            // Hold back suspicious-looking tag prefixes in case the
+                            // next token completes a real tag (e.g. "<too" then "l_call>").
+                            // Only hold if the partial looks like the start of a known tag.
+                            if let lt = u.lastIndex(of: "<") {
+                                let tail = u[lt...]
+                                // A known tag opener is either fully present or a prefix of one.
+                                let looksLikeTag = tagPrefixes.contains(where: {
+                                    tail.hasPrefix($0.prefix(min($0.count, tail.count))) || $0.hasPrefix(tail)
+                                })
+                                if looksLikeTag {
+                                    // Emit everything before the "<", hold the rest.
+                                    if lt != u.startIndex {
+                                        let safe = String(u[..<lt])
                                         if !safe.isEmpty {
                                             writeSSE(fd: fd, requestId: requestId, role: nil, content: safe, finishReason: nil, requestModel: reqModel)
-                                            emittedUpTo += safe.count
+                                            unemittedIdx = lt
                                         }
                                     }
                                     continue
                                 }
-                                // Not a tag -- emit everything including the `<`
-                                writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil, requestModel: reqModel)
-                                emittedUpTo = fullText.count
-                            } else {
-                                // Safe to emit
-                                writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil, requestModel: reqModel)
-                                emittedUpTo = fullText.count
+                            }
+
+                            // Nothing suspicious — emit the whole unemitted tail.
+                            if !u.isEmpty {
+                                writeSSE(fd: fd, requestId: requestId, role: nil, content: String(u), finishReason: nil, requestModel: reqModel)
+                                unemittedIdx = fullText.endIndex
                             }
 
                         case .toolCall(let tc):
-                            // generate() parsed it — emit directly
                             hadToolCall = true
+                            // Keepalive cancel here too in case .toolCall arrives before any .chunk.
+                            if !prefillReleased {
+                                keepaliveTimer?.cancel(); keepaliveTimer = nil
+                                await releasePrefillOnce()
+                            }
                             let argsDict = tc.function.arguments.mapValues { $0.anyValue }
                             let argsJSON = (try? JSONSerialization.data(withJSONObject: argsDict)) ?? Data()
                             let argsRaw = String(data: argsJSON, encoding: .utf8) ?? "{}"
                             emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw, requestModel: reqModel)
+
                         case .info(let info):
-                            log("  .info: tokens=\(tokenCount) fullText=\(fullText.count)ch emitted=\(emittedUpTo) hadToolCall=\(hadToolCall) think=\(inThinkBlock) thinkText=\(thinkText.count)ch")
+                            log("  .info: tokens=\(tokenCount) fullText=\(fullText.count)ch hadToolCall=\(hadToolCall) think=\(inThinkBlock)")
                             if fullText.count > 0 { log("  fullText preview: \(String(fullText.prefix(400)))") }
-                            if hadToolCall { log("  hadToolCall=true, unemitted=\(fullText.count - emittedUpTo)ch") }
-                            // Flush any remaining buffered text
-                            if emittedUpTo < fullText.count {
-                                let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
+
+                            // Flush any remaining buffered text not yet emitted.
+                            if unemittedIdx < fullText.endIndex {
+                                let remaining = String(fullText[unemittedIdx...])
                                 let remainTCs = parseAllToolCalls(remaining)
                                 if !remainTCs.isEmpty {
                                     hadToolCall = true
@@ -1052,29 +1245,41 @@ final class SimpleHTTPServer {
                                 } else if !remaining.isEmpty {
                                     writeSSE(fd: fd, requestId: requestId, role: nil, content: remaining, finishReason: nil, requestModel: reqModel)
                                 }
+                                unemittedIdx = fullText.endIndex
                             }
+
+                            // Finish reason: tool_calls if any tool was emitted, else
+                            // "length" only when the user capped max_tokens AND we hit it.
                             let maxTok = request.max_tokens ?? Int.max
-                            let fr = hadToolCall ? "tool_calls" : (info.generationTokenCount >= maxTok ? "length" : "stop")
+                            let fr: String
+                            if hadToolCall {
+                                fr = "tool_calls"
+                            } else if request.max_tokens != nil && info.generationTokenCount >= maxTok {
+                                fr = "length"
+                            } else {
+                                fr = "stop"
+                            }
                             let responseModel = reqModel ?? modelId
-                            let usageJSON = ",\"usage\":{\"prompt_tokens\":\(info.promptTokenCount),\"completion_tokens\":\(info.generationTokenCount),\"total_tokens\":\(info.promptTokenCount + info.generationTokenCount)}"
+                            let promptTokens = tokens.count
+                            let usageJSON = ",\"usage\":{\"prompt_tokens\":\(promptTokens),\"completion_tokens\":\(info.generationTokenCount),\"total_tokens\":\(promptTokens + info.generationTokenCount)}"
                             let finalEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\(fr)\"}]\(usageJSON)}\n\ndata: [DONE]\n\n"
-                            _ = finalEvent.withCString { write(fd, $0, Int(strlen($0))) }
+                            writeAll(fd, finalEvent)
                         }
                     }
                 } catch {
+                    keepaliveTimer?.cancel(); keepaliveTimer = nil
                     await releasePrefillOnce()
-                    // Generation error during streaming — send error SSE event and close cleanly
                     log("ERROR during streaming generation: \(error)")
-                    let errMsg = error.localizedDescription.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                    let errMsg = jsonEscape(error.localizedDescription)
                     let errEvent = "data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":500}}\n\ndata: [DONE]\n\n"
-                    _ = errEvent.withCString { write(fd, $0, Int(strlen($0))) }
+                    writeAll(fd, errEvent)
                 }
                 // Record timing and save cache
                 let elapsed = (CFAbsoluteTimeGetCurrent() - prefillStart) * 1000
                 await promptCache.recordTiming(prefillMs: 0, decodeMs: elapsed, decodeTokens: 0)
-                await promptCache.save(sessionId: sessionId, tokens: tokens)
+                await promptCache.save(sessionId: sessionId, promptTokens: tokens)
             } else {
-                keepaliveTimer?.cancel()
+                keepaliveTimer?.cancel(); keepaliveTimer = nil
 
                 // Non-streaming: collect all text
                 var fullText = ""
@@ -1096,9 +1301,8 @@ final class SimpleHTTPServer {
                     }
                 }
 
-                // Strip <think>...</think> blocks from thinking models, preserving as reasoning_content
+                // Strip <think>...</think>, preserving as reasoning_content.
                 log("  non-streaming fullText (\(fullText.count)ch): \(String(fullText.prefix(400)))")
-                log("  non-streaming fullText repr: \(fullText.debugDescription.prefix(400))")
                 var reasoningContent: String? = nil
                 if let thinkEnd = fullText.range(of: "</think>") {
                     var thinkContent = String(fullText[..<thinkEnd.lowerBound])
@@ -1108,7 +1312,7 @@ final class SimpleHTTPServer {
                     reasoningContent = thinkContent.trimmingCharacters(in: .whitespacesAndNewlines)
                     fullText = String(fullText[thinkEnd.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if fullText.hasPrefix("<think>") {
-                    // Incomplete think block -- strip it entirely, still save as reasoning
+                    // Incomplete think block — strip it entirely, still save as reasoning
                     var thinkContent = fullText
                     if let tagEnd = thinkContent.range(of: "<think>") {
                         thinkContent = String(thinkContent[tagEnd.upperBound...])
@@ -1118,31 +1322,29 @@ final class SimpleHTTPServer {
                     fullText = ""
                 }
 
-                // Parse tool calls from accumulated text (MiniMax XML, <function=>, etc.)
-                // These come through as .chunk text, not .toolCall events
+                // Parse tool calls from accumulated text (XML formats that don't
+                // flow through `.toolCall` events).
                 if toolCalls.isEmpty {
                     let parsed = parseAllToolCalls(fullText)
                     if !parsed.isEmpty {
                         for tc in parsed {
                             toolCalls.append((name: tc.name, args: tc.arguments))
                         }
-                        fullText = ""  // tool call consumed the text
+                        fullText = ""
                     }
                 }
 
-                // Echo request model name if provided, otherwise use local modelId
                 let responseModel = request.model ?? modelId
-
-                // Build response with tool_calls if present
                 let maxTok = request.max_tokens ?? Int.max
                 let finishReason: String
                 if !toolCalls.isEmpty {
                     finishReason = "tool_calls"
-                } else if completionTokens >= maxTok {
+                } else if request.max_tokens != nil && completionTokens >= maxTok {
                     finishReason = "length"
                 } else {
                     finishReason = "stop"
                 }
+
                 var responseBody: String
                 if toolCalls.isEmpty {
                     let response = ChatResponse(
@@ -1155,33 +1357,52 @@ final class SimpleHTTPServer {
                                     total_tokens: tokens.count + completionTokens))
                     responseBody = String(data: try JSONEncoder().encode(response), encoding: .utf8)!
                 } else {
-                    // Build tool_calls response manually (ChatResponse doesn't have tool_calls field)
-                    let tcJSON = toolCalls.enumerated().map { (i, tc) in
-                        "{\"id\":\"call_\(UUID().uuidString.prefix(8))\",\"type\":\"function\",\"function\":{\"name\":\"\(tc.name)\",\"arguments\":\(tc.args)}}"
+                    // OpenAI spec: tool_calls[].function.arguments must be a
+                    // JSON-ENCODED STRING, not a raw object. We escape the
+                    // JSON payload and wrap in quotes so both streaming and
+                    // non-streaming responses have the same shape.
+                    let tcJSON = toolCalls.map { tc in
+                        let tcId = "call_\(UUID().uuidString.prefix(8).lowercased())"
+                        let argsEscaped = jsonEscape(tc.args)
+                        let nameEscaped = jsonEscape(tc.name)
+                        return "{\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(nameEscaped)\",\"arguments\":\"\(argsEscaped)\"}}"
                     }.joined(separator: ",")
-                    let content = "\"\(fullText.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r"))\""
+                    let contentEscaped = jsonEscape(fullText)
                     let rcField: String
                     if let rc = reasoningContent {
-                        let rcEscaped = rc.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r")
-                        rcField = ",\"reasoning_content\":\"\(rcEscaped)\""
+                        rcField = ",\"reasoning_content\":\"\(jsonEscape(rc))\""
                     } else {
                         rcField = ""
                     }
-                    responseBody = "{\"id\":\"\(requestId)\",\"object\":\"chat.completion\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\(content)\(rcField),\"tool_calls\":[\(tcJSON)]},\"finish_reason\":\"\(finishReason)\"}],\"usage\":{\"prompt_tokens\":\(tokens.count),\"completion_tokens\":\(completionTokens),\"total_tokens\":\(tokens.count + completionTokens)}}"
+                    responseBody = "{\"id\":\"\(requestId)\",\"object\":\"chat.completion\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\(contentEscaped)\"\(rcField),\"tool_calls\":[\(tcJSON)]},\"finish_reason\":\"\(finishReason)\"}],\"usage\":{\"prompt_tokens\":\(tokens.count),\"completion_tokens\":\(completionTokens),\"total_tokens\":\(tokens.count + completionTokens)}}"
                 }
                 sendResponse(fd: fd, status: 200, body: responseBody,
                            contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
-                // Record timing and save cache
                 let elapsed = (CFAbsoluteTimeGetCurrent() - prefillStart) * 1000
                 await promptCache.recordTiming(prefillMs: 0, decodeMs: elapsed, decodeTokens: 0)
-                await promptCache.save(sessionId: sessionId, tokens: tokens)
+                await promptCache.save(sessionId: sessionId, promptTokens: tokens)
             }
         } catch {
             log("ERROR in handleChat: \(error)")
-            let errMsg = error.localizedDescription.replacingOccurrences(of: "\"", with: "'")
+            let errMsg = jsonEscape(error.localizedDescription)
             let err = "{\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":500}}"
-            sendResponse(fd: fd, status: 500, body: err, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
+            // If streaming headers were already sent, there's nothing safe to
+            // do but close. sendResponse here is best-effort for the non-stream
+            // and early-error paths.
+            if !isStreaming {
+                sendResponse(fd: fd, status: 500, body: err, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
+            }
         }
+
+        // ---------- Single-path cleanup ----------
+        // Everything that was acquired is released here, awaited inline so the
+        // next request sees correct state the moment handleChat returns.
+        keepaliveTimer?.cancel()
+        await releasePrefillOnce()
+        if let sid = markedSessionId {
+            await promptCache.markIdle(sid)
+        }
+        await slotManager.releaseSlot(slot)
     }
 
     func handleCompletions(fd: Int32, prompt: String, maxTokens: Int, temperature: Float, stream: Bool, corsOrigin: String = "*") async {
@@ -1193,7 +1414,6 @@ final class SimpleHTTPServer {
         slot.startTime = CFAbsoluteTimeGetCurrent()
         slot.state = .generating
         log("slot[\(slot.id)] acquired for \(requestId) (completions)")
-        defer { Task { await slotManager.releaseSlot(slot) } }
 
         do {
             let ctx = await container.perform { ctx in ctx }
@@ -1208,22 +1428,23 @@ final class SimpleHTTPServer {
 
             if stream {
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\r\n"
-                _ = header.withCString { write(fd, $0, Int(strlen($0))) }
+                writeAll(fd, header)
 
                 let result = try await container.generate(input: input, parameters: params)
+                var completionTokens = 0
                 for try await event in result {
                     if let chunk = event.chunk {
-                        let escaped = chunk.replacingOccurrences(of: "\\", with: "\\\\")
-                            .replacingOccurrences(of: "\"", with: "\\\"")
-                            .replacingOccurrences(of: "\n", with: "\\n")
-                        let sseData = "{\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"\(escaped)\",\"finish_reason\":null}]}"
-                        let sse = "data: \(sseData)\n\n"
-                        _ = sse.withCString { write(fd, $0, Int(strlen($0))) }
+                        completionTokens += 1
+                        let escaped = jsonEscape(chunk)
+                        let created = Int(Date().timeIntervalSince1970)
+                        let sse = "data: {\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"created\":\(created),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"text\":\"\(escaped)\",\"finish_reason\":null}]}\n\n"
+                        writeAll(fd, sse)
                     }
                     if event.info != nil {
-                        let sseData = "{\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}"
-                        let sse = "data: \(sseData)\n\ndata: [DONE]\n\n"
-                        _ = sse.withCString { write(fd, $0, Int(strlen($0))) }
+                        let created = Int(Date().timeIntervalSince1970)
+                        let usage = "\"usage\":{\"prompt_tokens\":\(tokens.count),\"completion_tokens\":\(completionTokens),\"total_tokens\":\(tokens.count + completionTokens)}"
+                        let sse = "data: {\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"created\":\(created),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}],\(usage)}\n\ndata: [DONE]\n\n"
+                        writeAll(fd, sse)
                     }
                 }
             } else {
@@ -1233,16 +1454,18 @@ final class SimpleHTTPServer {
                 for try await event in result {
                     if let chunk = event.chunk { fullText += chunk; usage.completion += 1 }
                 }
-                let escaped = fullText.replacingOccurrences(of: "\\", with: "\\\\")
-                    .replacingOccurrences(of: "\"", with: "\\\"")
-                    .replacingOccurrences(of: "\n", with: "\\n")
-                let body = "{\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"text\":\"\(escaped)\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":\(usage.prompt),\"completion_tokens\":\(usage.completion),\"total_tokens\":\(usage.prompt + usage.completion)}}"
+                let escaped = jsonEscape(fullText)
+                let body = "{\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"text\":\"\(escaped)\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":\(usage.prompt),\"completion_tokens\":\(usage.completion),\"total_tokens\":\(usage.prompt + usage.completion)}}"
                 sendResponse(fd: fd, status: 200, body: body, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
             }
         } catch {
-            let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
+            let errMsg = jsonEscape(String(describing: error))
             sendResponse(fd: fd, status: 500, body: "{\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":500}}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
         }
+
+        // Release slot inline — never via detached Task, which would return before
+        // release completes and the next acquireSlot() would see it still busy.
+        await slotManager.releaseSlot(slot)
     }
 
     /// Parse XML tool call from text: <function=name><parameter=key>value</parameter></function>
@@ -1397,35 +1620,31 @@ final class SimpleHTTPServer {
 
     /// Emit a tool call as an SSE event
     func emitToolCallSSE(fd: Int32, requestId: String, name: String, arguments: String, requestModel: String? = nil) {
-        let argsEscaped = arguments.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        let tcId = UUID().uuidString.lowercased()
+        // OpenAI spec: tool_calls[].function.arguments is a JSON-ENCODED STRING,
+        // so the raw JSON payload must be JSON-string-escaped before embedding.
+        let argsEscaped = jsonEscape(arguments)
+        let nameEscaped = jsonEscape(name)
+        let tcId = "call_\(UUID().uuidString.prefix(8).lowercased())"
         let responseModel = requestModel ?? modelId
-        let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
-        _ = tcEvent.withCString { write(fd, $0, Int(strlen($0))) }
+        let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(nameEscaped)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
+        writeAll(fd, tcEvent)
     }
 
     func writeSSE(fd: Int32, requestId: String, role: String?, content: String?, finishReason: String?, reasoningContent: String? = nil, requestModel: String? = nil, includeNullContent: Bool = false) {
-        // Build delta JSON manually to avoid encoding issues with nil
-        func escape(_ s: String) -> String {
-            s.replacingOccurrences(of: "\\", with: "\\\\")
-             .replacingOccurrences(of: "\"", with: "\\\"")
-             .replacingOccurrences(of: "\n", with: "\\n")
-             .replacingOccurrences(of: "\r", with: "\\r")
-        }
         var parts: [String] = []
-        if let role = role { parts.append("\"role\":\"\(escape(role))\"") }
+        if let role = role { parts.append("\"role\":\"\(jsonEscape(role))\"") }
         if let content = content {
-            parts.append("\"content\":\"\(escape(content))\"")
+            parts.append("\"content\":\"\(jsonEscape(content))\"")
         } else if includeNullContent {
             parts.append("\"content\":null")
         }
-        if let rc = reasoningContent { parts.append("\"reasoning_content\":\"\(escape(rc))\"") }
+        if let rc = reasoningContent { parts.append("\"reasoning_content\":\"\(jsonEscape(rc))\"") }
         let deltaJson = "{\(parts.joined(separator: ","))}"
 
-        let fr = finishReason.map { "\"\($0)\"" } ?? "null"
+        let fr = finishReason.map { "\"\(jsonEscape($0))\"" } ?? "null"
         let responseModel = requestModel ?? modelId
         let event = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"delta\":\(deltaJson),\"finish_reason\":\(fr)}]}\n\n"
-        _ = event.withCString { write(fd, $0, Int(strlen($0))) }
+        writeAll(fd, event)
     }
 
     func sendResponse(fd: Int32, status: Int, body: String, contentType: String, extraHeaders: String = "", corsOrigin: String = "*") {
@@ -1440,12 +1659,15 @@ final class SimpleHTTPServer {
         case 503: statusText = "Service Unavailable"
         default: statusText = "Unknown"
         }
-        let response = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.utf8.count)\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\(extraHeaders)\r\n\(body)"
-        _ = response.withCString { write(fd, $0, Int(strlen($0))) }
+        // Connection: close — we close(fd) immediately after this write anyway,
+        // and keepalive without a proper request loop leaves clients hanging.
+        let headers = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\(extraHeaders)\r\n"
+        if !writeAll(fd, headers) { return }
+        if !body.isEmpty { writeAll(fd, body) }
     }
 
     enum ServerError: Error {
-        case socketCreation, bind(UInt16), listen
+        case socketCreation, bind(UInt16), listen, clientDisconnected
     }
 }
 
