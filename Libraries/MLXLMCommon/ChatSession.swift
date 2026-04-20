@@ -508,7 +508,7 @@ public final class ChatSession {
     /// concurrently with an active ``respond(to:role:images:videos:)`` or
     /// ``streamResponse(_:)`` call on the same session. To persist the cache
     /// across process launches, use ``saveCache(to:)`` instead.
-    public func currentCache() async -> [KVCache]? {
+    public func currentCache() async -> sending [KVCache]? {
         await cache.read { cache in
             if case .kvcache(let array) = cache {
                 return array

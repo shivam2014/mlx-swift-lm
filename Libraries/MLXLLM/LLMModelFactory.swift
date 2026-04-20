@@ -19,10 +19,10 @@ private func create<C: Codable, M>(
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
 /// Typically called via ``LLMModelFactory/load(hub:configuration:progressHandler:)``.
-public enum LLMTypeRegistry {
+public enum LLMTypeRegistry: @unchecked Sendable {
 
     // Split into two dictionaries to avoid Swift type-checker limits on large literals
-    private static let coreCreators: [String: (Data) throws -> any LanguageModel] = [
+    private nonisolated(unsafe) static let coreCreators: [String: (Data) throws -> any LanguageModel] = [
         "mistral": create(LlamaConfiguration.self, LlamaModel.init),
         "llama": create(LlamaConfiguration.self, LlamaModel.init),
         "phi": create(PhiConfiguration.self, PhiModel.init),
@@ -50,7 +50,7 @@ public enum LLMTypeRegistry {
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
     ]
 
-    private static let extendedCreators: [String: (Data) throws -> any LanguageModel] = [
+    nonisolated(unsafe) private static let extendedCreators: [String: (Data) throws -> any LanguageModel] = [
         "granite": create(GraniteConfiguration.self, GraniteModel.init),
         "granitemoehybrid": create(
             GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),

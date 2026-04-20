@@ -8,8 +8,8 @@ import NativePrefillBridge
 
 // MARK: - Generic Prefill Bridge (SPM C++ target — shared allocator)
 
-final class GenericPrefillBridge {
-    static let shared = GenericPrefillBridge()
+final class GenericPrefillBridge: @unchecked Sendable {
+    nonisolated(unsafe) static let shared = GenericPrefillBridge()
 
     private var initializedModelType: String? = nil
 

@@ -112,9 +112,9 @@ public enum FusedGateActivationType: String {
 /// Input: gateUp [..., 2*H]  →  Output: activation(gate) * up  [..., H]
 ///
 /// Eliminates 3 separate dispatches (split, activation, multiply) with one kernel.
-private class FusedGateActivationKernel {
+private final class FusedGateActivationKernel: @unchecked Sendable {
 
-    static let shared = FusedGateActivationKernel()
+    nonisolated(unsafe) static let shared = FusedGateActivationKernel()
 
     private var kernels: [String: MLXFast.MLXFastKernel] = [:]
 

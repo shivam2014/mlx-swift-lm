@@ -19,8 +19,8 @@ import MLXNN
 /// to share the host's MLX allocator (no dual-allocator OOM).
 ///
 /// Activated by setting NATIVE_PREFILL=1 environment variable.
-private final class GemmaPrefillBridge {
-    static let shared = GemmaPrefillBridge()
+private final class GemmaPrefillBridge: @unchecked Sendable {
+    nonisolated(unsafe) static let shared = GemmaPrefillBridge()
 
     private var handle: UnsafeMutableRawPointer?
     private var initialized = false

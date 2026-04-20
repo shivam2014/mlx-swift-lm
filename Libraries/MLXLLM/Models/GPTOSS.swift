@@ -421,7 +421,7 @@ public class GPTOSSModelInner: Module {
         return x
     }
 
-    static var fwdCount = 0
+    nonisolated(unsafe) static var fwdCount = 0
 }
 
 private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXArray {

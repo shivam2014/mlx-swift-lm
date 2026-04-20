@@ -13,8 +13,8 @@ import MLXLMCommon
 import MLXNN
 import NativePrefillBridge
 
-final class QwenPrefillBridge {
-    static let shared = QwenPrefillBridge()
+final class QwenPrefillBridge: @unchecked Sendable {
+    nonisolated(unsafe) static let shared = QwenPrefillBridge()
 
     private var initializedModelType: String? = nil
 

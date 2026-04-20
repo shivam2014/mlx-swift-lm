@@ -63,7 +63,12 @@ public enum ModelFactoryError: LocalizedError {
 ///
 /// See also ``ModelFactory/loadContainer(hub:configuration:progressHandler:)`` and
 /// ``ModelContainer``.
-public struct ModelContext {
+///
+/// Access to ``ModelContext`` is serialized through ``ModelContainer`` which uses
+/// actor isolation to ensure thread-safe access. The model itself is not Sendable
+/// (MLX arrays are not thread-safe), but the serialization via actor isolation
+/// ensures safe access patterns.
+public struct ModelContext: @unchecked Sendable {
     public var configuration: ModelConfiguration
     public var model: any LanguageModel
     public var processor: any UserInputProcessor

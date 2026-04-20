@@ -321,7 +321,7 @@ actor ServerPromptCache {
 
     /// Find the session with the longest common prefix match.
     /// Returns (kvCache, newTokensToProcess, cacheStatus, sessionId).
-    func fetch(tokens newTokens: [Int], model: any LanguageModel) -> ([KVCache], [Int], CacheStatus, UUID) {
+    func fetch(tokens newTokens: [Int], model: sending any LanguageModel) -> FetchResult {
         var bestIdx = -1
         var bestPrefix = 0
 
@@ -384,7 +384,7 @@ actor ServerPromptCache {
                 let remaining = Array(newTokens[bestPrefix...])
                 let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
                 recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
-                return (session.kvCache, remaining, status, session.id)
+                return FetchResult(kvCache: session.kvCache, newTokens: remaining, status: status, sessionId: session.id)
             }
 
             // Quantized/compressed caches: trim leaves compressed K/V past the
@@ -430,7 +430,7 @@ actor ServerPromptCache {
                 let remaining = Array(newTokens[bestPrefix...])
                 let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
                 recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
-                return (session.kvCache, remaining, status, session.id)
+                return FetchResult(kvCache: session.kvCache, newTokens: remaining, status: status, sessionId: session.id)
             }
 
             return freshCache(tokens: newTokens, model: model)
@@ -439,7 +439,7 @@ actor ServerPromptCache {
         return freshCache(tokens: newTokens, model: model)
     }
 
-    private func freshCache(tokens: [Int], model: any LanguageModel) -> ([KVCache], [Int], CacheStatus, UUID) {
+    private func freshCache(tokens: [Int], model: sending any LanguageModel) -> FetchResult {
         evictIfNeeded()
         let kvParams = kvScheme.map { GenerateParameters(kvScheme: $0) }
         let cache = model.newCache(parameters: kvParams)
@@ -447,7 +447,7 @@ actor ServerPromptCache {
         sessions.append(session)
         let status = CacheStatus.miss(totalTokens: tokens.count, sessionsCount: sessions.count)
         recordRequest(hit: false, prefillTokens: tokens.count, reusedTokens: 0)
-        return (cache, tokens, status, session.id)
+        return FetchResult(kvCache: cache, newTokens: tokens, status: status, sessionId: session.id)
     }
 
     /// Save token state after generation completes.
@@ -531,7 +531,7 @@ actor ServerPromptCache {
     }
 }
 
-enum CacheStatus {
+enum CacheStatus: Sendable {
     case hit(prefixReused: Int, totalTokens: Int, newTokens: Int)
     case miss(totalTokens: Int, sessionsCount: Int)
     case trimFailed
@@ -546,6 +546,15 @@ enum CacheStatus {
             return "cache=trim_failed"
         }
     }
+}
+
+/// Wrapper for fetch() return value — [KVCache] and [Int] are not Sendable
+/// due to existential types, but the server manages these safely across threads.
+struct FetchResult: @unchecked Sendable {
+    let kvCache: [KVCache]
+    let newTokens: [Int]
+    let status: CacheStatus
+    let sessionId: UUID
 }
 
 // MARK: - Parallel Inference Slots (llama-server style)
@@ -770,7 +779,7 @@ actor SlotManager {
     }
 }
 
-final class SimpleHTTPServer {
+final class SimpleHTTPServer: @unchecked Sendable {
     let port: UInt16
     let container: ModelContainer
     let modelId: String
@@ -854,7 +863,8 @@ final class SimpleHTTPServer {
                 continue
             }
             configureClientSocket(client)
-            Task { await handleClient(client) }
+            let clientCopy = client
+            Task { await handleClient(clientCopy) }
         }
     }
 
@@ -971,12 +981,13 @@ final class SimpleHTTPServer {
                 await handleChat(fd: fd, request: request, corsOrigin: corsOrigin)
 
             case ("GET", "/tokenizer_info"), ("GET", "/v1/tokenizer_info"):
-                let ctx = await container.perform { ctx in ctx }
-                let eos = ctx.tokenizer.eosToken ?? ""
-                let bos = ctx.tokenizer.bosToken ?? ""
-                let eosId = ctx.tokenizer.eosTokenId ?? -1
-                let bosId = ctx.tokenizer.bosTokenId ?? -1
-                let info = "{\"eos_token\":\"\(eos)\",\"bos_token\":\"\(bos)\",\"eos_token_id\":\(eosId),\"bos_token_id\":\(bosId),\"model\":\"\(modelId)\"}"
+                let info = await container.perform { ctx in
+                    let eos = ctx.tokenizer.eosToken ?? ""
+                    let bos = ctx.tokenizer.bosToken ?? ""
+                    let eosId = ctx.tokenizer.eosTokenId ?? -1
+                    let bosId = ctx.tokenizer.bosTokenId ?? -1
+                    return "{\"eos_token\":\"\(eos)\",\"bos_token\":\"\(bos)\",\"eos_token_id\":\(eosId),\"bos_token_id\":\(bosId),\"model\":\"\(modelId)\"}"
+                }
                 sendResponse(fd: fd, status: 200, body: info, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("POST", "/tokenize"), ("POST", "/v1/tokenize"):
@@ -987,9 +998,10 @@ final class SimpleHTTPServer {
                     return
                 }
                 let addSpecial = json["add_special_tokens"] as? Bool ?? true
-                let ctx = await container.perform { ctx in ctx }
-                let tokens = ctx.tokenizer.encode(text: prompt, addSpecialTokens: addSpecial)
-                let tokensJson = "[\(tokens.map { String($0) }.joined(separator: ","))]"
+                let tokensJson = await container.perform { ctx in
+                    let tokens = ctx.tokenizer.encode(text: prompt, addSpecialTokens: addSpecial)
+                    return "[\(tokens.map { String($0) }.joined(separator: ","))]"
+                }
                 sendResponse(fd: fd, status: 200, body: "{\"tokens\":\(tokensJson)}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("POST", "/v1/completions"):
@@ -1014,8 +1026,9 @@ final class SimpleHTTPServer {
                 let activeSlots = await slotManager.activeSlotCount()
                 let queueDepth = await slotManager.queueDepth()
                 let totalSlots = await slotManager.slotCount()
+                let maxSess = promptCache.maxSessions
                 let body = """
-                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(await promptCache.maxSessions)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))},"slots":{"total":\(totalSlots),"active":\(activeSlots),"queue_depth":\(queueDepth)}}
+                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(maxSess)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))},"slots":{"total":\(totalSlots),"active":\(activeSlots),"queue_depth":\(queueDepth)}}
                 """
                 sendResponse(fd: fd, status: 200, body: body.trimmingCharacters(in: .whitespacesAndNewlines), contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
@@ -1057,12 +1070,6 @@ final class SimpleHTTPServer {
             default:
                 sendResponse(fd: fd, status: 404, body: "{\"error\":{\"message\":\"not found\",\"type\":\"not_found_error\",\"code\":404}}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
             }
-        } catch {
-            log("ERROR handling \(method) \(path): \(error)")
-            let msg = jsonEscape(error.localizedDescription)
-            sendResponse(fd: fd, status: 500,
-                       body: "{\"error\":{\"message\":\"\(msg)\",\"type\":\"server_error\",\"code\":500}}",
-                       contentType: "application/json; charset=utf-8", corsOrigin: originHeader ?? "*")
         }
 
         let elapsed = (CFAbsoluteTimeGetCurrent() - requestStart) * 1000
@@ -1185,7 +1192,11 @@ final class SimpleHTTPServer {
             log("  think detection: lastTokensText=\(lastTokensText.debugDescription) prefillsThink=\(promptPrefillsThink)")
             // Prompt caching: reuse KV state from previous requests
             let prefillStart = CFAbsoluteTimeGetCurrent()
-            let (reusedCache, fetchedNewTokens, cacheStatus, sessionId) = await promptCache.fetch(tokens: tokens, model: ctx.model)
+            let result = await promptCache.fetch(tokens: tokens, model: ctx.model)
+            let reusedCache = result.kvCache
+            let fetchedNewTokens = result.newTokens
+            let cacheStatus = result.status
+            let sessionId = result.sessionId
             await promptCache.markInUse(sessionId)
             markedSessionId = sessionId
 

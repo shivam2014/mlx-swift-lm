@@ -10,7 +10,7 @@ import Tokenizers
 // Persistent GPU stream matching Python mlx-lm's `generation_stream = mx.new_stream(...)`.
 // Enables prefill pipelining — 3-4x prefill improvement.
 private let _generationStreamLock = NSLock()
-private var _generationStream: MLX.Stream?
+private nonisolated(unsafe) var _generationStream: MLX.Stream?
 public var generationStream: MLX.Stream {
     _generationStreamLock.lock()
     defer { _generationStreamLock.unlock() }
@@ -133,7 +133,7 @@ public protocol LogitProcessor {
 /// - ``LogitProcessor``
 ///
 /// for the `TokenIterator`.
-public struct GenerateParameters: Sendable {
+public struct GenerateParameters: @unchecked Sendable {
 
     /// Step size for processing the prompt
     public var prefillStepSize: Int

@@ -171,7 +171,7 @@ public final class ModelContainer: Sendable {
     ///   allowing non-Sendable types like `LMInput` to safely cross isolation boundaries.
     public func generate(
         input: consuming sending LMInput,
-        cache: [KVCache]? = nil,
+        cache: sending [KVCache]? = nil,
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
@@ -211,7 +211,7 @@ public final class ModelContainer: Sendable {
     /// - Returns: An AsyncStream of token generation events
     public func generateTokens(
         input: consuming sending LMInput,
-        cache: [KVCache]? = nil,
+        cache: sending [KVCache]? = nil,
         parameters: GenerateParameters,
         includeStopToken: Bool = false,
         wiredMemoryTicket: WiredMemoryTicket? = nil
@@ -239,7 +239,7 @@ public final class ModelContainer: Sendable {
     ///
     /// - Parameter parameters: Generation parameters (controls cache type: simple vs rotating)
     /// - Returns: Array of KVCache instances, one per model layer
-    public func newCache(parameters: GenerateParameters? = nil) async -> [KVCache] {
+    public func newCache(parameters: GenerateParameters? = nil) async -> sending [KVCache] {
         await context.read { context in
             context.model.newCache(parameters: parameters)
         }
